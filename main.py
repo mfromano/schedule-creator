@@ -115,12 +115,19 @@ def build(schedule_file: str, prefs_file: str, output: str | None,
     click.echo("\n--- Phase 4: R4 Schedule Building ---")
     r4_meta = build_r4_schedules(r4s, grid, all_residents=residents)
     for name, meta in sorted(r4_meta.items()):
-        fixed = (meta.get("nrdr_mnuc_blocks", 0) + meta.get("esnr_neuro_blocks", 0)
-                 + meta.get("esir_mir_blocks", 0) + meta.get("research_blocks", 0)
-                 + meta.get("fse_blocks", 0))
-        grad_req = len(meta.get("grad_req_filled", {}))
-        remaining = len(meta.get("remaining_filled", {}))
-        click.echo(f"  {name}: fixed={fixed}, grad_req={grad_req}, fill={remaining}")
+        if meta.get("t32_clinical_filled") is not None:
+            # T32 resident
+            research = meta.get("research_blocks", 0)
+            clinical = meta.get("t32_clinical_filled", {})
+            click.echo(f"  {name} [T32]: research={research}, clinical={len(clinical)} "
+                        f"({', '.join(f'B{b}={c}' for b, c in sorted(clinical.items()))})")
+        else:
+            fixed = (meta.get("nrdr_mnuc_blocks", 0) + meta.get("esnr_neuro_blocks", 0)
+                     + meta.get("esir_mir_blocks", 0) + meta.get("research_blocks", 0)
+                     + meta.get("fse_blocks", 0))
+            grad_req = len(meta.get("grad_req_filled", {}))
+            remaining = len(meta.get("remaining_filled", {}))
+            click.echo(f"  {name}: fixed={fixed}, grad_req={grad_req}, fill={remaining}")
 
     # ── Phase 5: Night Float ──────────────────────────────────
     click.echo("\n--- Phase 5: Night Float Assignment ---")

@@ -11,6 +11,7 @@ def build_r4_schedules(
     residents: list[Resident],
     grid: ScheduleGrid,
     all_residents: list[Resident] | None = None,
+    t32_clinical_blocks: list[int] | None = None,
 ) -> dict[str, dict]:
     """Build R4 schedules: fixed commitments → grad reqs → fill remaining.
 
@@ -18,28 +19,97 @@ def build_r4_schedules(
         residents: R4 residents
         grid: schedule grid
         all_residents: all residents (for staffing needs assessment)
+        t32_clinical_blocks: blocks where T32 residents may be assigned
+            clinical coverage (typically May + first two weeks of June,
+            when R3s are on LC/CORE). Defaults to blocks 12-13.
 
     Returns:
         Per-resident schedule metadata.
     """
+    if t32_clinical_blocks is None:
+        t32_clinical_blocks = [12, 13]
+
     r4s = [r for r in residents if r.r_year == 4]
     metadata = {}
 
     for res in r4s:
         meta = {}
 
-        # Step 1: Place fixed commitments
-        _place_fixed_commitments(res, grid, meta)
+        if res.is_t32:
+            # T32 residents are on research all year except during
+            # high-need LC/CORE period (May + first two weeks of June)
+            _build_t32_schedule(res, grid, meta, t32_clinical_blocks)
+        else:
+            # Step 1: Place fixed commitments
+            _place_fixed_commitments(res, grid, meta)
 
-        # Step 2: Fill graduation requirements
-        _fill_grad_requirements(res, grid, meta)
+            # Step 2: Fill graduation requirements
+            _fill_grad_requirements(res, grid, meta)
 
-        # Step 3: Fill remaining capacity (Mx, Peds, MSK, etc.)
-        _fill_remaining(res, grid, meta, all_residents)
+            # Step 3: Fill remaining capacity (Mx, Peds, MSK, etc.)
+            _fill_remaining(res, grid, meta, all_residents)
 
         metadata[res.name] = meta
 
     return metadata
+
+
+def _build_t32_schedule(
+    res: Resident,
+    grid: ScheduleGrid,
+    meta: dict,
+    clinical_blocks: list[int],
+) -> None:
+    """Build schedule for a T32 resident.
+
+    T32 residents are on research for the entire year except during
+    the LC/CORE coverage period (May + first two weeks of June),
+    when they may be assigned clinical rotations to help cover staffing.
+    """
+    # Fill all non-clinical blocks with research
+    research_blocks = []
+    for block in range(1, 14):
+        if block not in clinical_blocks:
+            _assign_block(res, grid, block, "Res")
+            research_blocks.append(block)
+    meta["research_blocks"] = len(research_blocks)
+
+    # Fill clinical blocks from graduation requirements first, then staffing
+    clinical_filled = {}
+    available = list(clinical_blocks)
+
+    # Check graduation deficiencies — place those first
+    for rotation, count in sorted(res.recommended_blocks.items(),
+                                   key=lambda x: -x[1]):
+        blocks_needed = max(1, round(count))
+        placed = 0
+        for block in list(available):
+            if placed >= blocks_needed:
+                break
+            if not _has_hospital_conflict(res.schedule, block, rotation):
+                _assign_block(res, grid, block, rotation)
+                available.remove(block)
+                clinical_filled[block] = rotation
+                placed += 1
+
+    # Fill any remaining clinical blocks with staffing-need rotations
+    fill_rotations = ["Mai", "Mch", "Mus", "Mb", "Ser", "Mucic"]
+    rot_idx = 0
+    for block in list(available):
+        if rot_idx >= len(fill_rotations):
+            rot_idx = 0
+        code = fill_rotations[rot_idx]
+        if not _has_hospital_conflict(res.schedule, block, code):
+            _assign_block(res, grid, block, code)
+            available.remove(block)
+            clinical_filled[block] = code
+        rot_idx += 1
+
+    meta["t32_clinical_filled"] = clinical_filled
+    meta["available_after_fixed"] = []
+    meta["available_after_grad"] = []
+    meta["grad_req_filled"] = {}
+    meta["remaining_filled"] = {}
 
 
 def _place_fixed_commitments(res: Resident, grid: ScheduleGrid, meta: dict) -> None:

@@ -1,0 +1,17 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Excel temp/lock files
+~$*.xls*
+
+# Data files (contain resident PII)
+*.xlsm
+*.xlsx

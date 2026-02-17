@@ -40,7 +40,7 @@ class SectionPrefs:
 @dataclass
 class AIRPPrefs:
     """R3 AIRP session preferences."""
-    rankings: dict[int, int] = field(default_factory=dict)  # session_number → rank
+    rankings: dict[str, int] = field(default_factory=dict)  # session_id → rank
     group_requests: list[str] = field(default_factory=list)  # names of desired groupmates
 
 

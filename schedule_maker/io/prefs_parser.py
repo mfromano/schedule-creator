@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+from datetime import datetime
 from pathlib import Path
 
 import openpyxl
@@ -53,6 +55,36 @@ def _parse_rank(val) -> int | None:
         return int(s)
     except ValueError:
         return None
+
+
+# ── Combined form column constants ─────────────────────────
+_PGY_TO_RYEAR = {
+    "PGY-1": 1,
+    "PGY-2 (R1)": 2,
+    "PGY-3 (R2)": 3,
+    "PGY-4 (R3)": 4,
+}
+
+_SAMPLER_COLS: dict[int, str] = {
+    4: "Nir", 5: "Mir", 6: "Msk", 7: "Mnuc", 8: "Mucic",
+}
+
+_SECTION_COLS: dict[int, str] = {
+    28: "Mnuc", 29: "Mucic", 30: "Mai", 31: "Mus", 32: "Peds",
+    33: "Mch", 34: "Mb", 35: "Sbi", 36: "Smr", 37: "Ser",
+    38: "Vnuc", 39: "Pcbi", 40: "Zir",
+}
+
+# AIRP cols → session IDs matching AIRP_SESSIONS keys in r3_builder.py
+_AIRP_COLS: dict[int, str] = {
+    52: "2", 53: "3", 54: "5", 55: "9", 56: "10",
+}
+
+# Zir block preference columns (scattered across form due to Google Forms quirks).
+# Cols 41-51 and 94-99 may contain Zir block headers; block numbers are parsed
+# dynamically from headers.  Cols 44 (truncated "Block "), 98 ("No preference"),
+# and 99 ("Row 16") are excluded by the regex.
+_ZIR_COL_RANGE = list(range(41, 52)) + list(range(94, 100))
 
 
 class PrefsParser:
@@ -370,12 +402,251 @@ class PrefsParser:
     # ── Parse all ─────────────────────────────────────────────
 
     def parse_all(self, residents: list[Resident]) -> None:
-        """Parse all preference sheets and update residents in-place."""
-        self.parse_r1_prefs(residents)
-        self.parse_r2_prefs(residents)
-        self.parse_r3_prefs(residents)
-        self.parse_r4_prefs(residents)
-        self.parse_no_call_prefs(residents)
+        """Parse all preference sheets and update residents in-place.
+
+        Auto-detects format: if a combined "Form Responses 1" sheet exists
+        and no per-class sheets are present, uses the combined parser.
+        Otherwise falls back to the per-class sheet parser.
+        """
+        has_combined = "Form Responses 1" in self._wb.sheetnames
+        has_per_class = any(
+            s in self._wb.sheetnames
+            for s in ("R1 Rotations", "R2 Rotations", "R3 Rotations", "R4 Rotations")
+        )
+
+        if has_combined and not has_per_class:
+            self._parse_combined_form(residents)
+        else:
+            self.parse_r1_prefs(residents)
+            self.parse_r2_prefs(residents)
+            self.parse_r3_prefs(residents)
+            self.parse_r4_prefs(residents)
+            self.parse_no_call_prefs(residents)
+
+    # ── Combined form parsing ─────────────────────────────────
+
+    def _parse_combined_form(self, residents: list[Resident]) -> None:
+        """Parse the unified 'Form Responses 1' sheet (2026-2027+ format)."""
+        ws = self._wb["Form Responses 1"]
+        rows = list(ws.iter_rows(values_only=True))
+        if len(rows) < 2:
+            return
+
+        headers = rows[0]
+
+        # Build Zir col → block number mapping from headers
+        zir_col_map: dict[int, int] = {}
+        for i in _ZIR_COL_RANGE:
+            if i >= len(headers) or headers[i] is None:
+                continue
+            m = re.search(r"Block\s+(\d+)", str(headers[i]))
+            if m:
+                zir_col_map[i] = int(m.group(1))
+
+        # Build case-insensitive name lookup for all residents
+        name_map: dict[str, Resident] = {}
+        for r in residents:
+            name_map[f"{r.first_name} {r.last_name}".lower()] = r
+            name_map[r.name.lower()] = r
+            name_map[f"{r.last_name}, {r.first_name}".lower()] = r
+
+        # Deduplicate: keep only the latest response per (first, last)
+        latest: dict[tuple[str, str], tuple] = {}
+        for row in rows[1:]:
+            if not any(row):
+                continue
+            first = _str(row[1]).strip()
+            last = _str(row[2]).strip()
+            if not first or not last:
+                continue
+            pgy_str = _str(row[3])
+            if pgy_str not in _PGY_TO_RYEAR:
+                continue
+            key = (first.lower(), last.lower())
+            ts = row[0]
+            if key not in latest or (
+                ts and (latest[key][0] is None or ts > latest[key][0])
+            ):
+                latest[key] = (ts, row)
+
+        # Process each deduplicated response
+        for (_first_l, _last_l), (_ts, row) in latest.items():
+            first = _str(row[1]).strip()
+            last = _str(row[2]).strip()
+            r_year = _PGY_TO_RYEAR[_str(row[3])]
+
+            res = self._find_resident_combined(first, last, name_map)
+            if not res:
+                continue
+
+            if r_year == 1:
+                self._parse_combined_r1(row, res)
+            elif r_year == 2:
+                self._parse_combined_r2(row, res)
+            elif r_year == 3:
+                self._parse_combined_r3(row, res, zir_col_map)
+            elif r_year == 4:
+                self._parse_combined_r4(row, res)
+
+            self._parse_combined_shared(row, res)
+
+    @staticmethod
+    def _find_resident_combined(
+        first: str, last: str, name_map: dict[str, Resident],
+    ) -> Resident | None:
+        """Match a combined-form name to a roster resident."""
+        for key in (
+            f"{first} {last}".lower(),
+            f"{last}, {first}".lower(),
+        ):
+            if key in name_map:
+                return name_map[key]
+        # Fall back to case-insensitive last-name match
+        last_lower = last.lower()
+        for res in name_map.values():
+            if res.last_name.lower() == last_lower:
+                return res
+        return None
+
+    def _parse_combined_r1(self, row: tuple, res: Resident) -> None:
+        """Extract R1 sampler rankings and pathway interest."""
+        rankings = {}
+        for col, code in _SAMPLER_COLS.items():
+            rank = _parse_rank(row[col] if col < len(row) else None)
+            if rank is not None:
+                rankings[code] = rank
+        if rankings:
+            res.sampler_prefs = SamplerPrefs(rankings=rankings)
+
+        pathway_str = _str(row[9] if 9 < len(row) else "")
+        if pathway_str:
+            self._parse_pathway_string(res, pathway_str)
+
+    def _parse_combined_r2(self, row: tuple, res: Resident) -> None:
+        """Extract R2 track rankings and pathway interest."""
+        rankings = {}
+        for col_idx in range(11, 26):
+            track_num = col_idx - 10  # col 11 → Track 1, …, col 25 → Track 15
+            rank = _parse_rank(row[col_idx] if col_idx < len(row) else None)
+            if rank is not None:
+                rankings[track_num] = rank
+        if rankings:
+            res.track_prefs = TrackPrefs(rankings=rankings)
+
+        # R2 pathway (same question as R1, col 9)
+        pathway_str = _str(row[9] if 9 < len(row) else "")
+        if pathway_str:
+            self._parse_pathway_string(res, pathway_str)
+
+    def _parse_combined_r3(
+        self, row: tuple, res: Resident, zir_col_map: dict[int, int],
+    ) -> None:
+        """Extract R3 section prefs, Zir block prefs, AIRP rankings, pathway."""
+        # Section preferences (cols 28-40): #1-3 = top, #11-13 = bottom
+        scores: dict[str, int] = {}
+        top_sections: list[str] = []
+        bottom_sections: list[str] = []
+        for col, code in _SECTION_COLS.items():
+            rank = _parse_rank(row[col] if col < len(row) else None)
+            if rank is None:
+                continue
+            if 1 <= rank <= 3:
+                scores[code] = 4 - rank        # #1→+3, #2→+2, #3→+1
+                top_sections.append(code)
+            elif 11 <= rank <= 13:
+                scores[code] = -(14 - rank)     # #11→-3, #12→-2, #13→-1
+                bottom_sections.append(code)
+
+        res.section_prefs = SectionPrefs(
+            top=top_sections,
+            bottom=bottom_sections,
+            scores=scores,
+        )
+
+        # Zir block preferences — collect ranked blocks, sort by rank
+        block_ranks: dict[int, int] = {}
+        for col, block_num in sorted(zir_col_map.items()):
+            rank = _parse_rank(row[col] if col < len(row) else None)
+            if rank is not None and block_num not in block_ranks:
+                block_ranks[block_num] = rank
+        ranked = sorted(block_ranks.items(), key=lambda x: x[1])
+        res.zir_prefs = ZirPrefs(preferred_blocks=[b for b, _ in ranked])
+
+        # AIRP session rankings (cols 52-56)
+        airp_rankings: dict[str, int] = {}
+        for col, session_id in _AIRP_COLS.items():
+            rank = _parse_rank(row[col] if col < len(row) else None)
+            if rank is not None:
+                airp_rankings[session_id] = rank
+        res.airp_prefs = AIRPPrefs(rankings=airp_rankings)
+
+        # Pathway (col 26)
+        pathway_str = _str(row[26] if 26 < len(row) else "")
+        if pathway_str:
+            self._parse_pathway_string(res, pathway_str)
+
+    def _parse_combined_r4(self, row: tuple, res: Resident) -> None:
+        """Extract R4 pathway, FSE, research/CEP."""
+        # Pathway (cols 57-59)
+        pursuing = _str(row[57] if 57 < len(row) else "")
+        which = _str(row[58] if 58 < len(row) else "")
+        t32 = _str(row[59] if 59 < len(row) else "")
+
+        if pursuing.lower() == "yes" and which:
+            self._parse_pathway_string(res, which)
+        if t32.lower() == "yes":
+            res.pathway |= Pathway.T32
+
+        # FSE (cols 62-63)
+        fse_choice = _str(row[62] if 62 < len(row) else "")
+        fse_org = _str(row[63] if 63 < len(row) else "")
+        if fse_choice:
+            res.fse_prefs = FSEPrefs(
+                specialties=[s.strip() for s in fse_choice.split(",") if s.strip()],
+                organization=fse_org,
+            )
+
+        # Research / CEP (cols 64-65)
+        for col, attr in ((64, "research_months"), (65, "cep_months")):
+            val = row[col] if col < len(row) else None
+            if val is not None:
+                try:
+                    setattr(res, attr, int(float(val)))
+                except (ValueError, TypeError):
+                    pass
+
+    def _parse_combined_shared(self, row: tuple, res: Resident) -> None:
+        """Extract no-call weekends, vacation, academic, leave."""
+        # No-call weekends (cols 70-71) — datetime objects from Google Forms
+        raw_dates: list[str] = []
+        for col in (70, 71):
+            val = row[col] if col < len(row) else None
+            if val is None:
+                continue
+            if isinstance(val, datetime):
+                raw_dates.append(f"{val.month}/{val.day}")
+            else:
+                s = _str(val)
+                if s:
+                    raw_dates.append(s)
+
+        # Holiday preferences (cols 72-73)
+        holiday_free = _str(row[73] if 73 < len(row) else "")
+        holidays = [holiday_free] if holiday_free else []
+
+        res.no_call = NoCallDates(raw_dates=raw_dates, holidays=holidays)
+
+        # Vacation, academic, leave (cols 77-79)
+        vac = _str(row[77] if 77 < len(row) else "")
+        acad = _str(row[78] if 78 < len(row) else "")
+        leave = _str(row[79] if 79 < len(row) else "")
+
+        if vac:
+            res.vacation_dates = [vac]
+        if acad:
+            res.academic_dates = [acad]
+        if leave:
+            res.leave_info = leave
 
     # ── Helpers ───────────────────────────────────────────────
 

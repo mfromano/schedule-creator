@@ -7,14 +7,14 @@ from schedule_maker.models.schedule import ScheduleGrid
 from schedule_maker.models.rotation import get_hospital_system, HospitalSystem
 
 
-# AIRP session definitions (from 2025 prefs — update for each year)
+# AIRP session definitions — update for each year
 AIRP_SESSIONS = {
     # session_id: (block_number, description)
-    "2": (2, "Aug Virtual"),
-    "3+4": (3, "Sep In-Person"),
-    "4+5": (4, "Oct Virtual"),
-    "9": (9, "Feb Virtual"),
-    "10": (10, "Mar Virtual"),
+    "2": (2, "Aug 3-28 Virtual"),
+    "3": (3, "Sep 14 - Oct 9 In-person"),
+    "5": (5, "Oct 19 - Nov 13 Virtual"),
+    "9": (9, "Jan 25 - Feb 19 Virtual"),
+    "10": (10, "Mar 1-26 Virtual"),
 }
 MAX_PER_AIRP_SESSION = 4
 

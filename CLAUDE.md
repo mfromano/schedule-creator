@@ -62,6 +62,22 @@ CLI entry point is `main.py` (click-based). The `schedule_maker/` package has fi
 - **NucMed credit**: 4 weeks of Mai/Mch/Peds/Mx = 1 week Mnuc equivalent (non-NRDR only)
 - **Track rotation formula**: `position = ((track_num - 1) + (block - 1) * 2) % seq_len + 1`
 
+## Excel / openpyxl Gotchas
+
+- openpyxl `data_only=True` only reads cached values; formula cells may return `None` if Excel hasn't recalculated. Track grid columns are formula-based — derive from base sequence in column C instead.
+- Always use `keep_vba=True` when loading `.xlsm` files to preserve macros.
+- Never Cut/Paste or Delete rows/columns in the Excel — only Clear Contents (per goals.md).
+- Historical tab Column A = Current PGY (prior year), Column B = Future PGY (target year). Always use Column B.
+- PCMB (P-prefix) is the same payroll entity as Moffitt (M-prefix) — both map to `HospitalSystem.UCSF`.
+- R3-4 Recs is authoritative for pathway flags. `PrefsParser` uses `|=` (additive), so `read_r34_recs` must run AFTER `parse_all` to overwrite with `=`.
+
+## Test Results (2025-2026 data)
+
+- 60 residents (15/class), R2 penalty=6, 0 hospital conflicts, 0 R4 grad deficits
+- R1/R2: full 52-week coverage via derived tracks
+- NF: 104 weeks across 45 residents
+- 65 under-minimum staffing violations (mostly early blocks where R3 schedules are partially filled by design)
+
 ## Data Files
 
 The `~$` prefixed Excel files are temporary lock files from having spreadsheets open — do not read or commit them.

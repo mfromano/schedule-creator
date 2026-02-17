@@ -109,7 +109,7 @@ def build_r3_schedules(
     grid: ScheduleGrid,
     core_exam_block: int = 8,
 ) -> dict[str, dict]:
-    """Build R3 schedules: AIRP + LC + graduation requirements.
+    """Build R3 schedules: AIRP + LC + graduation requirements + fill remaining.
 
     Returns per-resident schedule metadata.
     """
@@ -121,13 +121,17 @@ def build_r3_schedules(
     # Step 2: Assign LC
     assign_learning_center(r3s, grid, core_exam_block)
 
-    # Step 3: Fill remaining blocks with required rotations
+    # Step 3: Fill blocks from graduation requirements
     metadata = {}
     for res in r3s:
-        filled = _fill_r3_requirements(res, grid)
+        req_filled = _fill_r3_requirements(res, grid)
+
+        # Step 4: Fill remaining empty blocks with general clinical rotations
+        remaining_filled = _fill_r3_remaining(res, grid)
+
         metadata[res.name] = {
             "airp_session": airp_assignments.get(res.name, ""),
-            "filled_blocks": filled,
+            "filled_blocks": {**req_filled, **remaining_filled},
         }
 
     return metadata
@@ -136,11 +140,15 @@ def build_r3_schedules(
 def _fill_r3_requirements(res: Resident, grid: ScheduleGrid) -> dict[int, str]:
     """Fill remaining empty blocks for an R3 resident with required rotations.
 
+    Iterates rotation-first: for each needed rotation, find the best
+    available block.  This avoids dropping rotations when a single block
+    has a hospital-system conflict.
+
     Respects:
     - Hospital system conflicts
-    - No Zir before LC
-    - NRDR breast requirements
-    - T32/ESIR/ESNR NM/breast requirements
+    - No Zir in or after the block before LC
+    - Zir block preferences
+    - NRDR/ESIR/ESNR/T32 pathway requirements
     """
     filled = {}
 
@@ -151,7 +159,7 @@ def _fill_r3_requirements(res: Resident, grid: ScheduleGrid) -> dict[int, str]:
         if not any(res.schedule.get(w) for w in weeks):
             available_blocks.append(block)
 
-    # Determine LC block (find it)
+    # Determine LC block
     lc_block = None
     for block in range(1, 14):
         weeks = list(grid.block_to_weeks(block))
@@ -160,16 +168,16 @@ def _fill_r3_requirements(res: Resident, grid: ScheduleGrid) -> dict[int, str]:
             break
 
     # Build priority rotation list from recommended_blocks
-    needed_rotations = []
+    needed_rotations: list[str] = []
     for rotation, count in sorted(res.recommended_blocks.items(),
                                    key=lambda x: -x[1]):
         blocks_needed = max(1, round(count))
         for _ in range(blocks_needed):
             needed_rotations.append(rotation)
 
-    # Also add deficient sections as rotations
+    # Also add deficient sections not already covered
     for section in res.deficient_sections:
-        if section not in [r for r in needed_rotations]:
+        if section not in needed_rotations:
             needed_rotations.append(section)
 
     # NRDR: need 6 blocks Mnuc
@@ -178,40 +186,87 @@ def _fill_r3_requirements(res: Resident, grid: ScheduleGrid) -> dict[int, str]:
         for _ in range(max(0, mnuc_needed)):
             needed_rotations.insert(0, "Mnuc")
 
-    # Assign rotations to available blocks
-    rotation_idx = 0
-    for block in available_blocks:
-        if rotation_idx >= len(needed_rotations):
+    # Assign rotations to available blocks (rotation-first iteration)
+    used_blocks: set[int] = set()
+    for code in needed_rotations:
+        placed = False
+        for block in available_blocks:
+            if block in used_blocks:
+                continue
+
+            # No Zir in the block immediately before LC or later
+            if code == "Zir" and lc_block and block >= lc_block - 1:
+                continue
+
+            if _has_hospital_conflict(res.schedule, block, code):
+                continue
+
+            # Zir block preferences: defer to a preferred block if available
+            if code == "Zir" and res.zir_prefs and res.zir_prefs.preferred_blocks:
+                if block not in res.zir_prefs.preferred_blocks:
+                    preferred_available = [
+                        b for b in res.zir_prefs.preferred_blocks
+                        if b in available_blocks and b not in used_blocks
+                    ]
+                    if preferred_available:
+                        continue
+
+            # Place it
+            _assign_block(res, grid, block, code)
+            filled[block] = code
+            used_blocks.add(block)
+            placed = True
             break
 
-        code = needed_rotations[rotation_idx]
+    return filled
 
-        # Skip Zir before LC
-        if code == "Zir" and lc_block and block >= lc_block - 1:
-            # Try to find a different block for Zir or swap
-            rotation_idx += 1
-            continue
 
-        # Check hospital conflict
-        if _has_hospital_conflict(res.schedule, block, code):
-            rotation_idx += 1
-            continue
+def _fill_r3_remaining(res: Resident, grid: ScheduleGrid) -> dict[int, str]:
+    """Fill remaining empty R3 blocks with general clinical rotations.
 
-        # Check Zir block preferences
-        if code == "Zir" and res.zir_prefs and res.zir_prefs.preferred_blocks:
-            if block not in res.zir_prefs.preferred_blocks:
-                # Try to defer Zir to a preferred block
-                # Only skip if a preferred block is still available
-                preferred_available = [b for b in res.zir_prefs.preferred_blocks
-                                       if b in available_blocks and b != block]
-                if preferred_available:
-                    continue
+    After graduation requirements are placed, any empty blocks are filled
+    with rotations that help cover staffing needs: Peds (if short), then
+    a round-robin of common clinical services.
+    """
+    filled = {}
 
-        # Assign
-        for w in grid.block_to_weeks(block):
-            grid.assign(res.name, w, code)
-            res.schedule[w] = code
-        filled[block] = code
-        rotation_idx += 1
+    available_blocks = []
+    for block in range(1, 14):
+        weeks = list(grid.block_to_weeks(block))
+        if not any(res.schedule.get(w) for w in weeks):
+            available_blocks.append(block)
+
+    if not available_blocks:
+        return filled
+
+    # Peds if < 2 blocks (8 weeks) completed
+    peds_weeks = res.history.get("Peds", 0)
+    if peds_weeks < 8:
+        for block in list(available_blocks):
+            if not _has_hospital_conflict(res.schedule, block, "Peds"):
+                _assign_block(res, grid, block, "Peds")
+                available_blocks.remove(block)
+                filled[block] = "Peds"
+                break
+
+    # Fill remaining with staffing-need rotations (round-robin)
+    fill_rotations = ["Mai", "Mch", "Mus", "Mucic", "Mb", "Ser"]
+    rot_idx = 0
+    for block in list(available_blocks):
+        if rot_idx >= len(fill_rotations):
+            rot_idx = 0
+        code = fill_rotations[rot_idx]
+        if not _has_hospital_conflict(res.schedule, block, code):
+            _assign_block(res, grid, block, code)
+            available_blocks.remove(block)
+            filled[block] = code
+        rot_idx += 1
 
     return filled
+
+
+def _assign_block(res: Resident, grid: ScheduleGrid, block: int, code: str) -> None:
+    """Assign a rotation code to all weeks of a block."""
+    for w in grid.block_to_weeks(block):
+        grid.assign(res.name, w, code)
+        res.schedule[w] = code

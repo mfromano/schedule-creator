@@ -133,31 +133,69 @@ class ExcelReader:
 
     # ── Historical (Roster + History) ────────────────────────
 
+    def _detect_historical_layout(self) -> dict:
+        """Auto-detect the Historical tab column layout.
+
+        Two known layouts:
+          Layout A (2025-2026): A=Current PGY, B=Future PGY, C=Resident, D+=history
+          Layout B (2026-2027): A=Current PGY, B=Resident, C+=ESNR/ESIR/T32/NRDR, G+=history
+
+        Returns dict with 'pgy_col', 'name_col', 'has_future_pgy', 'history_start_col',
+        and pathway column indices.
+        """
+        ws = self._wb["Historical"]
+        headers = []
+        for row in ws.iter_rows(min_row=2, max_row=2, max_col=10, values_only=True):
+            headers = [_str(v) for v in row]
+            break
+
+        if len(headers) > 1 and "future" in headers[1].lower():
+            # Layout A: A=Current PGY, B=Future PGY, C=Resident
+            return {
+                "has_future_pgy": True,
+                "pgy_col": 1,      # Future PGY in column B
+                "name_col": 2,     # Resident in column C
+                "history_start_col": 3,
+                "pathway_cols": None,  # No pathway columns in this layout
+            }
+        else:
+            # Layout B: A=Current PGY, B=Resident, C=ESNR, D=ESIR, E=T32, F=NRDR
+            return {
+                "has_future_pgy": False,
+                "pgy_col": 0,      # Current PGY in column A (will increment by 1)
+                "name_col": 1,     # Resident in column B
+                "history_start_col": 6,  # Block data starts after pathway cols
+                "pathway_cols": {"esnr": 2, "esir": 3, "t32": 4, "nrdr": 5},
+            }
+
     def read_roster(self) -> list[Resident]:
         """Parse the Historical tab to get all residents with PGY.
 
-        Historical tab layout:
-        - Row 2 headers: A='Current PGY', B='Future PGY', C='Resident',
-          D onwards = weekly rotation history
-        - Row 3+: data
+        Supports two layouts:
+          Layout A: Has 'Future PGY' column — use directly.
+          Layout B: Only 'Current PGY' — increment by 1 to get target year PGY.
 
-        We use **Future PGY** (column B) because "Current PGY" reflects the
-        prior academic year (when the file was prepared).  The schedule is
-        built for the *upcoming* year, so Future PGY gives the correct class:
-        PGY-2=R1, PGY-3=R2, PGY-4=R3, PGY-5=R4, PGY-6=graduated (skip).
+        Target year PGY: PGY-2=R1, PGY-3=R2, PGY-4=R3, PGY-5=R4.
+        PGY-1 (interns) and PGY-6+ (graduated) are skipped.
         """
         ws = self._wb["Historical"]
+        layout = self._detect_historical_layout()
         residents = []
 
-        for row in ws.iter_rows(min_row=3, max_col=3, values_only=True):
-            future_pgy = row[1]  # Column B = Future PGY
-            name = _str(row[2])  # Column C = Resident name
-            if not name or not future_pgy:
+        max_col = max(layout["name_col"] + 1, 7)
+        for row in ws.iter_rows(min_row=3, max_col=max_col, values_only=True):
+            raw_pgy = row[layout["pgy_col"]]
+            name = _str(row[layout["name_col"]])
+            if not name or not raw_pgy:
                 continue
             try:
-                pgy_int = int(future_pgy)
+                pgy_int = int(raw_pgy)
             except (ValueError, TypeError):
                 continue
+
+            # If no Future PGY column, increment current PGY by 1
+            if not layout["has_future_pgy"]:
+                pgy_int += 1
 
             r_year = pgy_int - 1  # PGY-2=R1, PGY-3=R2, etc.
             if r_year < 1 or r_year > 4:
@@ -168,13 +206,25 @@ class ExcelReader:
             last = parts[0].strip()
             first = parts[1].strip() if len(parts) > 1 else ""
 
-            residents.append(Resident(
+            res = Resident(
                 name=name,
                 first_name=first,
                 last_name=last,
                 pgy=pgy_int,
                 r_year=r_year,
-            ))
+            )
+
+            # Parse pathway flags if present in this layout
+            if layout["pathway_cols"]:
+                pw = layout["pathway_cols"]
+                res.pathway = _parse_pathway(
+                    _str(row[pw["esnr"]]) if len(row) > pw["esnr"] else "",
+                    _str(row[pw["esir"]]) if len(row) > pw["esir"] else "",
+                    _str(row[pw["t32"]]) if len(row) > pw["t32"] else "",
+                    _str(row[pw["nrdr"]]) if len(row) > pw["nrdr"] else "",
+                )
+
+            residents.append(res)
 
         return residents
 
@@ -182,20 +232,21 @@ class ExcelReader:
         """Read 4 years of weekly rotation history from Historical tab.
 
         Updates residents' history dict in-place with cumulative weeks per rotation.
-        Historical tab layout: A=Current PGY, B=Future PGY, C=Resident,
-        D onwards (index 3+) = weekly rotation codes across 4 years.
+        Auto-detects layout to find the correct name and history start columns.
         """
         ws = self._wb["Historical"]
+        layout = self._detect_historical_layout()
+        name_col = layout["name_col"]
+        history_start = layout["history_start_col"]
         name_to_resident = {r.name: r for r in residents}
 
         for row in ws.iter_rows(min_row=3, values_only=True):
-            name = _str(row[2]) if len(row) > 2 else ""
+            name = _str(row[name_col]) if len(row) > name_col else ""
             if name not in name_to_resident:
                 continue
 
             res = name_to_resident[name]
-            # Columns D onwards (index 3+) contain weekly rotation codes
-            for col_idx in range(3, len(row)):
+            for col_idx in range(history_start, len(row)):
                 code = _str(row[col_idx])
                 if code and code not in ("", "0"):
                     res.history[code] = res.history.get(code, 0) + 1

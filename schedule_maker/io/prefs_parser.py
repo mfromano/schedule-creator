@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import random
 import re
 from datetime import datetime
 from pathlib import Path
@@ -133,7 +134,7 @@ class PrefsParser:
         if "R1 Rotations" not in self._wb.sheetnames:
             return
 
-        rows = self._read_sheet_as_dicts("R1 Rotations")
+        rows = self._dedup_rows(self._read_sheet_as_dicts("R1 Rotations"))
         name_map = {f"{r.first_name} {r.last_name}": r for r in residents if r.r_year == 1}
         # Also try "Last, First" format
         name_map.update({r.name: r for r in residents if r.r_year == 1})
@@ -175,7 +176,7 @@ class PrefsParser:
         if "R2 Rotations" not in self._wb.sheetnames:
             return
 
-        rows = self._read_sheet_as_dicts("R2 Rotations")
+        rows = self._dedup_rows(self._read_sheet_as_dicts("R2 Rotations"))
         name_map = self._build_name_map(residents, r_year=2)
 
         for row in rows:
@@ -219,7 +220,7 @@ class PrefsParser:
         if "R3 Rotations" not in self._wb.sheetnames:
             return
 
-        rows = self._read_sheet_as_dicts("R3 Rotations")
+        rows = self._dedup_rows(self._read_sheet_as_dicts("R3 Rotations"))
         name_map = self._build_name_map(residents, r_year=3)
 
         section_codes = [
@@ -307,7 +308,7 @@ class PrefsParser:
         if "R4 Rotations" not in self._wb.sheetnames:
             return
 
-        rows = self._read_sheet_as_dicts("R4 Rotations")
+        rows = self._dedup_rows(self._read_sheet_as_dicts("R4 Rotations"))
         name_map = self._build_name_map(residents, r_year=4)
 
         for row in rows:
@@ -401,6 +402,18 @@ class PrefsParser:
 
     # ── Parse all ─────────────────────────────────────────────
 
+    @staticmethod
+    def _fill_missing_r1_prefs(residents: list[Resident]) -> None:
+        """Assign random sampler rankings to R1 residents who did not submit preferences."""
+        codes = list(_SAMPLER_COLS.values())
+        for res in residents:
+            if res.r_year == 1 and res.sampler_prefs is None:
+                shuffled = codes[:]
+                random.shuffle(shuffled)
+                rankings = {code: rank for rank, code in enumerate(shuffled, 1)}
+                res.sampler_prefs = SamplerPrefs(rankings=rankings)
+                print(f"[prefs] {res.name}: no R1 preferences found — assigned random sampler rankings")
+
     def parse_all(self, residents: list[Resident]) -> None:
         """Parse all preference sheets and update residents in-place.
 
@@ -422,6 +435,7 @@ class PrefsParser:
             self.parse_r3_prefs(residents)
             self.parse_r4_prefs(residents)
             self.parse_no_call_prefs(residents)
+        self._fill_missing_r1_prefs(residents)
 
     # ── Combined form parsing ─────────────────────────────────
 
@@ -649,6 +663,27 @@ class PrefsParser:
             res.leave_info = leave
 
     # ── Helpers ───────────────────────────────────────────────
+
+    @staticmethod
+    def _dedup_rows(rows: list[dict]) -> list[dict]:
+        """Keep only the latest response per resident name using the Timestamp column."""
+        latest: dict[str, tuple] = {}  # name_key -> (timestamp, row)
+        for row in rows:
+            name = _str(row.get("Full Name", "")) or _str(row.get("Name", ""))
+            if not name:
+                first = _str(row.get("First Name", ""))
+                last = _str(row.get("Last Name", ""))
+                name = f"{first} {last}".strip()
+            if not name:
+                continue
+            key = name.lower()
+            ts = row.get("Timestamp")
+            stored_ts = latest[key][0] if key in latest else None
+            if key not in latest \
+                    or (ts is not None and (stored_ts is None or ts > stored_ts)) \
+                    or (ts is None and stored_ts is None):
+                latest[key] = (ts, row)
+        return [row for _, row in latest.values()]
 
     def _build_name_map(self, residents: list[Resident], r_year: int) -> dict[str, Resident]:
         """Build a name lookup map for residents of a given year."""

@@ -52,13 +52,13 @@ STANDARD_GRAD_REQS = [
         label="Breast Imaging",
         section="BI",
         required_weeks=12,
-        qualifying_rotations={"Pcbi", "Mb", "Sbi", "Vb"},
+        qualifying_rotations={"Pcbi", "Sbi"},
     ),
     GraduationRequirement(
         label="Nuclear Medicine (non-NRDR)",
         section="NM",
         required_weeks=16,
-        qualifying_rotations={"Mnuc", "Vnuc", "Snct", "Mnct"},
+        qualifying_rotations={"Mnuc", "Vnuc"},
         partial_credit_rotations={"Mai": 0.25, "Mch": 0.25, "Peds": 0.25, "Mx": 0.25},
         applies_to_pathway="non-NRDR",
     ),
@@ -66,7 +66,7 @@ STANDARD_GRAD_REQS = [
         label="Nuclear Medicine (NRDR)",
         section="NM",
         required_weeks=48,
-        qualifying_rotations={"Mnuc", "Vnuc", "Snct", "Mnct"},
+        qualifying_rotations={"Mnuc", "Vnuc"},
         # NB: 4:1 partial credit does NOT apply to NRDR
         applies_to_pathway="NRDR",
     ),
@@ -81,7 +81,7 @@ STANDARD_GRAD_REQS = [
         label="ESNR (Neuro R4)",
         section="NR",
         required_weeks=24,  # 6 blocks × 4 weeks, max 1 on Smr
-        qualifying_rotations={"Zai", "Smr"},
+        qualifying_rotations={"Mucic", "Smr"},
         applies_to_pathway="ESNR",
     ),
 ]
@@ -130,14 +130,28 @@ class GraduationRequirements:
 
 
 @dataclass
+class StaffingConstraint:
+    """A single staffing minimum/maximum from Base Schedule rows 101-151."""
+    label: str
+    min_count: int
+    rotation_codes: set[str]
+    r_years: set[int] = field(default_factory=set)  # empty = all years
+
+
+@dataclass
 class NFRules:
     """Night float assignment rules from goals.md."""
     # R2 gets 2 weeks Mnf (Snf already in track)
     r2_mnf_weeks: int = 2
     # R3 max total NF = 3 (Snf2 + Mnf combined)
     r3_max_nf: int = 3
+    # R3 Mnf/Snf2 split (defaults: up to 2 Mnf, up to 2 Snf2)
+    r3_mnf_max: int = 2
+    r3_snf2_max: int = 2
     # R4 gets 2 weeks Snf2
     r4_snf2_weeks: int = 2
+    # R4 Mnf (normally 0, but can be overridden by NF Recs)
+    r4_mnf_weeks: int = 0
     # Minimum spacing between NF assignments (weeks)
     min_spacing_weeks: int = 4
 
@@ -154,3 +168,48 @@ class NFRules:
     preferred_pull_rotations: set[str] = field(default_factory=lambda: {
         "Pcmb", "Mb", "Mucic", "Peds", "Mnuc", "Pcbi",
     })
+
+    @classmethod
+    def from_nf_recs(cls, nf_recs: dict) -> "NFRules":
+        """Construct NFRules from NF Recs tab data.
+
+        nf_recs format: {pgy_str: {"values": [mnf_1wk, mnf_2wk, snf2_1wk, snf2_2wk, ...]}}
+        Rows are keyed by PGY string (e.g. "3", "4", "5", "PGY-3", etc.).
+        """
+        rules = cls()
+
+        # Try to find R2 (PGY-3), R3 (PGY-4), R4 (PGY-5) data
+        def _find_row(target_keys: list[str]) -> list[float] | None:
+            for k in target_keys:
+                if k in nf_recs:
+                    return nf_recs[k].get("values", [])
+            return None
+
+        r2_data = _find_row(["3", "PGY-3", "PGY3", "R2"])
+        r3_data = _find_row(["4", "PGY-4", "PGY4", "R3"])
+        r4_data = _find_row(["5", "PGY-5", "PGY5", "R4"])
+
+        if r2_data and len(r2_data) >= 2:
+            # cols B-E: mnf_1wk, mnf_2wk, snf2_1wk, snf2_2wk
+            mnf_total = int(r2_data[0]) * 1 + int(r2_data[1]) * 2
+            if mnf_total > 0:
+                rules.r2_mnf_weeks = mnf_total
+
+        if r3_data and len(r3_data) >= 4:
+            mnf_total = int(r3_data[0]) * 1 + int(r3_data[1]) * 2
+            snf2_total = int(r3_data[2]) * 1 + int(r3_data[3]) * 2
+            rules.r3_max_nf = mnf_total + snf2_total if (mnf_total + snf2_total) > 0 else rules.r3_max_nf
+            if mnf_total > 0:
+                rules.r3_mnf_max = mnf_total
+            if snf2_total > 0:
+                rules.r3_snf2_max = snf2_total
+
+        if r4_data and len(r4_data) >= 4:
+            snf2_total = int(r4_data[2]) * 1 + int(r4_data[3]) * 2
+            if snf2_total > 0:
+                rules.r4_snf2_weeks = snf2_total
+            mnf_total = int(r4_data[0]) * 1 + int(r4_data[1]) * 2
+            if mnf_total > 0:
+                rules.r4_mnf_weeks = mnf_total
+
+        return rules

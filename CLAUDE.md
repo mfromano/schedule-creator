@@ -16,8 +16,42 @@ Uses **uv** for package management, requires **Python 3.14**.
 
 ```bash
 uv sync                        # install dependencies
-uv run python main.py build "Schedule Creation (2025-2026).xlsm" "Schedule Preferences 2025 (Responses).xlsx" --dry-run
-uv run python main.py build "Schedule Creation (2025-2026).xlsm" "Schedule Preferences 2025 (Responses).xlsx" -o output.xlsm
+```
+
+### Single-Step Build (Recommended)
+
+Builds the schedule directly from the template + Google Forms responses. R3-4 recommended
+blocks and NF rules are computed in Python — no need to open Excel first:
+
+```bash
+uv run python main.py build "Schedule Creation (2025-2026).xlsm" \
+  "Schedule Preferences 2025 (Responses).xlsx" --dry-run
+uv run python main.py build "Schedule Creation (2025-2026).xlsm" \
+  "Schedule Preferences 2025 (Responses).xlsx" -o output.xlsm
+```
+
+The output file includes preferences in the Preferences tab + the completed schedule.
+
+### Two-Step Workflow (Legacy)
+
+If you need Excel to recalculate formulas (e.g. Historical Tabulation for auditing):
+
+```bash
+# Step 1: Import Google Forms responses into the Preferences tab
+uv run python main.py import-prefs \
+  "Schedule Creation (2025-2026).xlsm" \
+  "Schedule Preferences 2025 (Responses).xlsx"
+# → produces "Schedule Creation (2025-2026)_with_prefs.xlsm"
+
+# Step 2: Open _with_prefs.xlsm in Excel, let formulas recalculate, save and close.
+
+# Step 3: Build schedule from the _with_prefs file (no separate prefs file needed)
+uv run python main.py build "Schedule Creation (2025-2026)_with_prefs.xlsm" -o output.xlsm
+```
+
+### Validate an existing schedule
+
+```bash
 uv run python main.py validate "Schedule Creation (2025-2026).xlsm"
 ```
 

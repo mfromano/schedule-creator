@@ -15,23 +15,60 @@ uv sync
 
 ## Usage
 
-### Build a schedule
+### Build a schedule (single-step, recommended)
+
+Builds the schedule directly from the template + Google Forms responses. R3-4 recommended blocks and NF rules are computed in Python — no need to open Excel first:
 
 ```bash
-uv run python main.py build "Schedule Creation (2025-2026).xlsm" "Schedule Preferences 2025 (Responses).xlsx" --dry-run
-uv run python main.py build "Schedule Creation (2025-2026).xlsm" "Schedule Preferences 2025 (Responses).xlsx" -o output.xlsm
+uv run python main.py build "Schedule Creation (2025-2026).xlsm" \
+  "Schedule Preferences 2025 (Responses).xlsx" --dry-run
+uv run python main.py build "Schedule Creation (2025-2026).xlsm" \
+  "Schedule Preferences 2025 (Responses).xlsx" -o output.xlsm
 ```
 
 Options:
-- `--dry-run` — run the full pipeline and validate without writing output
+- `--dry-run` — run the full pipeline and validate without writing output (produces `dryrun_schedule.xlsx`)
 - `-o / --output` — output file path (default: `<input>_output.xlsm`)
 - `-y / --year` — academic year start (auto-detected if omitted)
+- `--core-block` — block number for CORE exam (default: 13)
+- `--lc-weeks` — comma-separated week numbers for Learning Center (e.g. `46,47,48,49`)
+- `--core-weeks` — comma-separated week numbers for CORE (e.g. `50,51`)
+
+### Two-step workflow (legacy)
+
+If you need Excel to recalculate formulas (e.g. Historical Tabulation for auditing):
+
+```bash
+# Step 1: Import Google Forms responses into the Preferences tab
+uv run python main.py import-prefs \
+  "Schedule Creation (2025-2026).xlsm" \
+  "Schedule Preferences 2025 (Responses).xlsx"
+# → produces "Schedule Creation (2025-2026)_with_prefs.xlsm"
+
+# Step 2: Open _with_prefs.xlsm in Excel, let formulas recalculate, save and close.
+
+# Step 3: Build schedule from the _with_prefs file (no separate prefs file needed)
+uv run python main.py build "Schedule Creation (2025-2026)_with_prefs.xlsm" -o output.xlsm
+```
+
+`import-prefs` options:
+- `-o / --output` — output file path (default: `<input>_with_prefs.xlsm`)
 
 ### Validate an existing schedule
 
 ```bash
 uv run python main.py validate "Schedule Creation (2025-2026).xlsm"
 ```
+
+### Generate equity report
+
+```bash
+uv run python main.py stats "Schedule Creation (2025-2026).xlsm"
+uv run python main.py stats "Schedule Creation (2025-2026).xlsm" -o report.txt
+```
+
+Options:
+- `-o / --output` — write report to file instead of stdout
 
 ## Input Files
 
@@ -54,7 +91,9 @@ schedule_maker/
 │   ├── io/                          # Excel I/O
 │   │   ├── excel_reader.py          #   Reads all .xlsm tabs
 │   │   ├── excel_writer.py          #   Writes back to .xlsm (preserves macros)
-│   │   └── prefs_parser.py          #   Parses Google Forms preference responses
+│   │   ├── prefs_parser.py          #   Parses Google Forms preference responses
+│   │   ├── prefs_writer.py          #   Writes preferences to Preferences tab
+│   │   └── dryrun_writer.py         #   Writes dry-run schedule to plain .xlsx
 │   ├── phases/                      # Pipeline stages (executed in order)
 │   │   ├── r1_assignment.py         #   1. R1 → track (1:1 mapping)
 │   │   ├── r2_assignment.py         #   2. R2 → track via CP-SAT (minimize rank penalty)
@@ -62,6 +101,7 @@ schedule_maker/
 │   │   ├── r4_builder.py            #   4. R4 schedules (fixed commitments, grad reqs, fill)
 │   │   ├── night_float.py           #   5. NF overlay via CP-SAT solver
 │   │   └── sampler.py               #   6. Replace R1 "Msamp" with specific rotations
+│   ├── staffing_utils.py            # Staffing-aware fill scoring and year eligibility
 │   ├── solver/                      # OR-Tools CP-SAT wrappers
 │   │   ├── track_matcher.py         #   Assignment problem for R2 tracks
 │   │   └── nf_solver.py             #   Night float placement with spacing constraints
@@ -69,6 +109,7 @@ schedule_maker/
 │       ├── staffing.py              #   Per-rotation minimum staffing checks
 │       ├── graduation.py            #   Cumulative weeks vs graduation requirements
 │       ├── hospital_conflict.py     #   No two hospital systems in same block
+│       ├── equity_report.py         #   Anonymized distribution stats (stats command)
 │       └── report.py                #   Aggregates all checks into a text report
 └── tests/
     ├── generate_dummy_prefs.py      # Generate test preference data

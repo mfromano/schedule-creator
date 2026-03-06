@@ -37,7 +37,7 @@ class Section(Enum):
 # Prefix → hospital system mapping
 SITE_PREFIX_MAP: dict[str, HospitalSystem] = {
     "M": HospitalSystem.UCSF,
-    "Z": HospitalSystem.ZSFG,
+    "Z": HospitalSystem.UCSF,  # Zion campus — same UCSF payroll entity
     "S": HospitalSystem.ZSFG,  # SFGH rotations (Sx, Sir, Ser, Smr, Sbi, Snf, Snf2, Sus, Snct)
     "V": HospitalSystem.VA,
     "P": HospitalSystem.UCSF,  # Parnassus/China Basin = same UCSF payroll as Moffitt
@@ -46,19 +46,19 @@ SITE_PREFIX_MAP: dict[str, HospitalSystem] = {
 # Rotation code → section mapping (comprehensive from Key tab + goals.md)
 ROTATION_SECTION: dict[str, Section] = {
     # Nuclear medicine
-    "Mnuc": Section.NM, "Vnuc": Section.NM, "Snct": Section.NM, "Mnct": Section.NM,
+    "Mnuc": Section.NM, "Snct": Section.NM, "Mnct": Section.NM,
     # Breast imaging
-    "Pcbi": Section.BI, "Mb": Section.BI, "Sbi": Section.BI, "Vb": Section.BI,
+    "Pcbi": Section.BI, "Sbi": Section.BI,
     # Neuroradiology
-    "Zai": Section.NR, "Smr": Section.NR,
+    "Smr": Section.NR,
     # Abdominal imaging
-    "Mai": Section.AI, "Sai": Section.AI,
+    "Zai": Section.AI, "Mai": Section.AI, "Sai": Section.AI,
     # Ultrasound
     "Mus": Section.US, "Sus": Section.US,
     # Chest/cardiac
     "Mch": Section.CH, "Mch2": Section.CH, "Sch": Section.CH,
     # MSK
-    "Mb": Section.MSK,  # also BI — dual-counted
+    "Mb": Section.MSK, "Vb": Section.MSK,
     "Ser": Section.MSK, "Mucic": Section.MSK,
     # Pediatrics
     "Peds": Section.PD,
@@ -69,11 +69,19 @@ ROTATION_SECTION: dict[str, Section] = {
 }
 
 # Rotations that give partial NucMed credit (4 weeks = 1 week NM credit)
-NM_PARTIAL_CREDIT_ROTATIONS = {"Mai", "Mch", "Peds", "Mx"}
+NM_PARTIAL_CREDIT_ROTATIONS = {"Mai", "Mch", "Mch2", "Peds", "Mx"}
 NM_PARTIAL_RATIO = 0.25  # 1 week NM credit per 4-week block
 
 # Rotations that do NOT give NM partial credit
-NM_NO_CREDIT = {"Mc", "Mmr", "Zai"}
+NM_NO_CREDIT = {"Mc", "Mmr"}
+
+# Section name → rotation code mapping (shared between excel_reader, r4_builder, etc.)
+SECTION_TO_ROTATION_CODES: dict[str, list[str]] = {
+    "AI": ["Mai", "Zai"], "Breast": ["Pcbi", "Sbi"], "Cardiac": ["Mch"],
+    "Chest": ["Mch"], "MSK": ["Mb", "Ser"], "Neuro": ["Mucic"],
+    "Peds": ["Peds"], "US": ["Mus"], "NucMed": ["Mnuc"],
+    "IR": ["Mir", "Zir"],
+}
 
 
 @dataclass
@@ -104,8 +112,38 @@ def get_hospital_system(code: str) -> HospitalSystem:
     # Special cases
     if code in ("Peds",):
         return HospitalSystem.UCSF
+    if code.startswith("FSE-"):
+        return HospitalSystem.UCSF  # all FSEs are at Moffitt sites
     first = code[0]
     return SITE_PREFIX_MAP.get(first, HospitalSystem.OTHER)
+
+
+# FSE specialty abbreviation → staffing-equivalent rotation codes.
+# Used so FSE blocks count towards the correct staffing group.
+FSE_STAFFING_MAP: dict[str, str] = {
+    "Abd": "Mai",
+    "Bre": "Pcbi",
+    "Che": "Mch",
+    "Car": "Mch",   # Cardiovascular → chest/cardiac group
+    "Mus": "Mb",
+    "Ped": "Peds",
+    "Nuc": "Mnuc",
+    "Neu": "Mucic",
+    "Ult": "Mus",
+    "IR":  "Mir",
+    "Int": "Mir",   # Interventional
+}
+
+
+def fse_to_base_code(fse_code: str) -> str:
+    """Map an FSE rotation code (e.g. 'FSE-Abd') to its staffing-equivalent base code.
+
+    Returns the FSE code unchanged if no mapping exists.
+    """
+    if not fse_code.startswith("FSE-"):
+        return fse_code
+    suffix = fse_code[4:]
+    return FSE_STAFFING_MAP.get(suffix, fse_code)
 
 
 def is_night_float(code: str) -> bool:

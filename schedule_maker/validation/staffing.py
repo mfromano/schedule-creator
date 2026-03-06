@@ -5,7 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from schedule_maker.models.schedule import ScheduleGrid
-from schedule_maker.models.rotation import get_hospital_system, HospitalSystem
+from schedule_maker.models.rotation import get_hospital_system, HospitalSystem, fse_to_base_code
+from schedule_maker.models.constraints import StaffingConstraint
 
 
 @dataclass
@@ -21,46 +22,82 @@ class StaffingViolation:
 
 # Per-rotation minimum requirements derived from Base Schedule rows 101-151.
 # Format: label → (set of rotation codes, minimum required)
-# Maximums are not enforced (they depend on total class size and are informational).
+# Updated for 2026-2027 spreadsheet layout.
 ROTATION_MINIMUMS: dict[str, tuple[set[str], int]] = {
-    "Moffitt AI": ({"Mai"}, 3),
+    # ── Group-level minimums (all R-years) ──
+    "Moffitt AI": ({"Mai", "Zai"}, 3),
     "Moffitt US": ({"Mus"}, 2),
-    "Moffitt Cardiothoracic": ({"Mch", "Mch2"}, 2),
+    "Moffitt Cardiothoracic": ({"Mch", "Mch2", "Mc"}, 2),
     "Peds": ({"Peds"}, 1),
+    "Moffitt Neuro": ({"Mucic", "Mnct"}, 3),
     "Moffitt Bone": ({"Mb"}, 1),
-    "Moffitt Nucs": ({"Mnuc", "Mnct"}, 2),
+    "Moffitt Nucs": ({"Mnuc"}, 2),
     "PCMB Breast": ({"Pcbi"}, 1),
     "ZSFG Total": ({"Ser", "Smr", "Sbi", "Sir", "Sus", "Sai", "Snct",
                      "Sch", "Sch2", "Sx", "SSamplerCh2"}, 8),
-    "VA MSK/Nucs": ({"Vnuc", "Vb", "Vn"}, 1),
-    "IR Total": ({"Mir", "Zir", "Sir", "Vir"}, 1),
+    "VA MSK/Nucs": ({"Vb"}, 1),
     "Mucic": ({"Mucic"}, 1),
+    "Zir": ({"Zir"}, 1),
+}
+
+# Per-rotation maximum constraints (exclusivity rules).
+ROTATION_MAXIMUMS: dict[str, tuple[set[str], int]] = {
+    "Sx": ({"Sx"}, 1),
+    "Snf": ({"Snf"}, 1),
+    "Mnf": ({"Mnf"}, 1),
+    "Snf2": ({"Snf2"}, 1),
+    "PCMB Breast": ({"Pcbi"}, 3),
+    "NucMed Total": ({"Mnuc"}, 5),
+    "VA MSK": ({"Vb"}, 1),
+    "VA IR": ({"Vir"}, 1),
+    "Zir": ({"Zir"}, 1),
+    "Ser": ({"Ser"}, 2),
+    "Mai": ({"Mai"}, 5),
+    "Mucic": ({"Mucic"}, 6),
 }
 
 
 def check_staffing(
     grid: ScheduleGrid,
     num_weeks: int = 52,
-    bounds: dict | None = None,
+    constraints: list[StaffingConstraint] | None = None,
 ) -> list[StaffingViolation]:
-    """Check staffing levels using per-rotation minimums.
+    """Check staffing levels using per-rotation minimums and maximums.
 
-    Only flags UNDER-staffing (below minimum). Over-staffing is reported
-    in the summary but not treated as a violation since maximums vary.
+    If dynamic constraints are provided, uses those for minimum checks.
+    Always uses ROTATION_MAXIMUMS for maximum checks.
+    Falls back to ROTATION_MINIMUMS when no dynamic constraints given.
     """
     violations = []
+
+    # Build minimums source
+    if constraints:
+        min_entries = [(sc.label, sc.rotation_codes, sc.min_count) for sc in constraints]
+    else:
+        min_entries = [(label, codes, min_req) for label, (codes, min_req) in ROTATION_MINIMUMS.items()]
 
     for week in range(1, num_weeks + 1):
         week_assignments = grid.get_week_assignments(week)
         block = grid.week_to_block(week)
 
-        for label, (codes, min_req) in ROTATION_MINIMUMS.items():
-            count = sum(1 for code in week_assignments.values() if code in codes)
+        for label, codes, min_req in min_entries:
+            count = sum(1 for code in week_assignments.values()
+                        if code in codes or fse_to_base_code(code) in codes)
             if count < min_req:
                 violations.append(StaffingViolation(
                     week=week, block=block, label=label,
                     count=count, min_required=min_req, max_allowed=99,
                     is_under=True,
+                ))
+
+        for label, (codes, max_allowed) in ROTATION_MAXIMUMS.items():
+            count = sum(1 for code in week_assignments.values()
+                        if code in codes or fse_to_base_code(code) in codes)
+            if count > max_allowed:
+                violations.append(StaffingViolation(
+                    week=week, block=block, label=label,
+                    count=count, min_required=0, max_allowed=max_allowed,
+                    is_under=False,
                 ))
 
     return violations

@@ -19,6 +19,7 @@ class HospitalConflict:
 def check_hospital_conflicts(
     residents: list[Resident],
     num_blocks: int = 13,
+    exempt_names: set[str] | None = None,
 ) -> list[HospitalConflict]:
     """Check that no resident has two hospital systems in the same block.
 
@@ -26,8 +27,11 @@ def check_hospital_conflicts(
     (e.g., UCSF, SFGH, VA) in the same block as it creates problems for payroll.
     """
     conflicts = []
+    _exempt = exempt_names or set()
 
     for res in residents:
+        if res.name in _exempt:
+            continue
         for block in range(1, num_blocks + 1):
             start_week = (block - 1) * 4 + 1
 

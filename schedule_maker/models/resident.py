@@ -71,6 +71,8 @@ class NoCallDates:
     weeks: list[tuple[date, date]] = field(default_factory=list)  # (start, end) ranges
     holidays: list[str] = field(default_factory=list)  # e.g. ["Christmas", "Thanksgiving"]
     raw_dates: list[date] = field(default_factory=list)  # parsed MM/DD dates for NF tab
+    holiday_history: list[str] = field(default_factory=list)  # 3 entries for years 2023-24, 2024-25, 2025-26
+    holiday_work_pref: str = ""  # "Christmas", "Thanksgiving", "New Years", or "No Preference"
 
 
 @dataclass
@@ -114,6 +116,13 @@ class Resident:
     vacation_dates: list[str] = field(default_factory=list)
     academic_dates: list[str] = field(default_factory=list)
     leave_info: str = ""
+
+    # Comment-derived soft constraints
+    comments: str = ""
+    nf_timing_pref: str = ""       # "early", "late", "avoid-july", "early-holidays-ok", "late-fall", "avoid-core-adjacent", "holidays-ok"
+    schedule_weight: str = ""      # "front-heavy", "back-heavy"
+    block_requests: dict[int, str] = field(default_factory=dict)  # block → rotation code
+    pathway_org_pref: str = ""     # "contiguous" or "interspersed"
 
     @property
     def is_nrdr(self) -> bool:

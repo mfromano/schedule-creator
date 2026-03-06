@@ -46,6 +46,16 @@ def _int(val) -> int:
         return 0
 
 
+_NEGATIVE_FSE_PATTERNS = re.compile(
+    r"\b(no|none|n/a|not|don'?t|do not)\b", re.IGNORECASE
+)
+
+
+def _is_negative_fse(val: str) -> bool:
+    """Return True if the FSE response indicates the resident does not want an FSE."""
+    return bool(val and _NEGATIVE_FSE_PATTERNS.search(val))
+
+
 def _parse_rank(val) -> int | None:
     """Parse a rank value like '#1', '1', or 'Top 1' into an integer."""
     s = _str(val)
@@ -318,6 +328,8 @@ class PrefsParser:
 
             # FSE preferences
             fse_str = _str(row.get("FSE", ""))
+            if _is_negative_fse(fse_str):
+                fse_str = ""
             fse_org = _str(row.get("FSE/Rotation Pref", ""))
             dist_pref = _str(row.get("Distribution Pref", ""))
             res.fse_prefs = FSEPrefs(
@@ -515,11 +527,17 @@ class PrefsParser:
         ):
             if key in name_map:
                 return name_map[key]
-        # Fall back to case-insensitive last-name match
+        # Fall back to case-insensitive last-name match, but only if the
+        # last name is unique among all residents to avoid cross-contamination
+        # (e.g. "Kaelan Chan" matching "Shin Mei Chan").
         last_lower = last.lower()
-        for res in name_map.values():
-            if res.last_name.lower() == last_lower:
-                return res
+        matches = {
+            id(res): res
+            for res in name_map.values()
+            if res.last_name.lower() == last_lower
+        }
+        if len(matches) == 1:
+            return next(iter(matches.values()))
         return None
 
     def _parse_combined_r1(self, row: tuple, res: Resident) -> None:
@@ -592,7 +610,11 @@ class PrefsParser:
             rank = _parse_rank(row[col] if col < len(row) else None)
             if rank is not None:
                 airp_rankings[session_id] = rank
-        res.airp_prefs = AIRPPrefs(rankings=airp_rankings)
+
+        # AIRP group (col 51, mislabeled as "Block 4: 9/21/2026..." in form)
+        airp_group_str = _str(row[51] if 51 < len(row) else "")
+        group_requests = [g.strip() for g in airp_group_str.split(",") if g.strip()] if airp_group_str else []
+        res.airp_prefs = AIRPPrefs(rankings=airp_rankings, group_requests=group_requests)
 
         # Pathway (col 26)
         pathway_str = _str(row[26] if 26 < len(row) else "")
@@ -611,13 +633,29 @@ class PrefsParser:
         if t32.lower() == "yes":
             res.pathway |= Pathway.T32
 
+        # Pathway organization (col 60)
+        pathway_org = _str(row[60] if 60 < len(row) else "")
+        if "sequential" in pathway_org.lower() or "contiguous" in pathway_org.lower():
+            res.pathway_org_pref = "contiguous"
+        elif "interspersed" in pathway_org.lower() or "interrupted" in pathway_org.lower():
+            res.pathway_org_pref = "interspersed"
+
         # FSE (cols 62-63)
         fse_choice = _str(row[62] if 62 < len(row) else "")
         fse_org = _str(row[63] if 63 < len(row) else "")
+        if _is_negative_fse(fse_choice):
+            fse_choice = ""
         if fse_choice:
+            org = fse_org or pathway_org
+            if "sequential" in org.lower() or "contiguous" in org.lower():
+                org_normalized = "contiguous"
+            elif "interspersed" in org.lower() or "interrupted" in org.lower():
+                org_normalized = "interspersed"
+            else:
+                org_normalized = org
             res.fse_prefs = FSEPrefs(
                 specialties=[s.strip() for s in fse_choice.split(",") if s.strip()],
-                organization=fse_org,
+                organization=org_normalized,
             )
 
         # Research / CEP (cols 64-65)
@@ -630,7 +668,7 @@ class PrefsParser:
                     pass
 
     def _parse_combined_shared(self, row: tuple, res: Resident) -> None:
-        """Extract no-call weekends, vacation, academic, leave."""
+        """Extract no-call weekends, vacation, academic, leave, holiday history/pref."""
         # No-call weekends (cols 70-71) — datetime objects from Google Forms
         raw_dates: list[str] = []
         for col in (70, 71):
@@ -644,11 +682,22 @@ class PrefsParser:
                 if s:
                     raw_dates.append(s)
 
+        # Holiday history (cols 68-70, 0-based)
+        holiday_history: list[str] = []
+        for col in (68, 69, 70):
+            val = row[col] if col < len(row) else None
+            holiday_history.append(str(val).strip() if val is not None else "")
+
         # Holiday preferences (cols 72-73)
         holiday_free = _str(row[73] if 73 < len(row) else "")
         holidays = [holiday_free] if holiday_free else []
 
-        res.no_call = NoCallDates(raw_dates=raw_dates, holidays=holidays)
+        res.no_call = NoCallDates(
+            raw_dates=raw_dates,
+            holidays=holidays,
+            holiday_history=holiday_history,
+            holiday_work_pref=holiday_free,
+        )
 
         # Vacation, academic, leave (cols 77-79)
         vac = _str(row[77] if 77 < len(row) else "")
@@ -661,6 +710,11 @@ class PrefsParser:
             res.academic_dates = [acad]
         if leave:
             res.leave_info = leave
+
+        # Comments (col 93, 0-based)
+        comment_text = _str(row[93] if 93 < len(row) else "")
+        if comment_text:
+            res.comments = comment_text
 
     # ── Helpers ───────────────────────────────────────────────
 

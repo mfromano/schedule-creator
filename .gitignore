@@ -15,3 +15,5 @@ wheels/
 # Data files (contain resident PII)
 *.xlsm
 *.xlsx
+
+./claude/rules/resident_comments.md

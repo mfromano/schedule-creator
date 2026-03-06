@@ -131,21 +131,12 @@ Aim to send this by mid February, with requests due in mid March.
 
 ## Research/CEP
 
-E-mail current R3s to solicit research and CEP proposals.  Do this by mid January. Stipulations are:
+Stipulations are:
 
 *   Maximum of 2 months research/CEP allowed per resident unless they have supplementary funding. 
     
-*   T32 residents cannot apply
-    
 *   ESIR and NR-DR residents: one month research applies towards ESIR/NRDR graduation requirements  
-      
-    
 
-Once aggregated, prepare a summary of proposals and review them with Soonmee. Only assign electives once core clinical staffing needs are met (~45 residents/day). Giving too many electives will be disastrous for clinical operations.
-
-## NR/DR
-
-Maintain a very guarded stance if asked about the feasibility of allowing >2 residents/class to pursue NR/DR. They are siphoned to nuclear medicine for 6 blocks/year/person for two consecutive years, creating a large vacancy the remaining co-residents must fill. A single extra person will make your life difficult, their co-residents spread thin, and sections perpetually near minimum staffing. To a lesser extent, the same goes for ESIR, ESNR, and T32, but it would only impact a single year.
 
 ## Preference Entry
 
@@ -309,92 +300,3 @@ Some additional pointers:
     
 3.  Open the “Night Float” tab and scroll down to row 106-118. Confirm that each service has an appropriate number of residents assigned each week. There is both a minimum and a maximum number of residents that can be assigned to any given service, and individual weeks will be highlighted if staffing falls below the minimum or above the maximum.
     
-
-# Distributing the Schedule
-
-## To the Residents
-
-1.  Open the Master Schedule.
-    
-2.  Click on Tools > Macro > Macros.
-    
-3.  Select “Schedule\_Publish” and click “Run.”
-    
-4.  After some time, a new worksheet will be generated. Save this worksheet as “Resident Vacation Schedule 20XX-20XX”, editing the years applicable.
-    
-5.  Take a very close look at blocks 1, 13, as well as any blocks containing/flanking AIRP and CORE. The automation process glitches when task assignments are not cleanly occupying the standard bimonthly recipe.
-    
-6.  Upload the Schedule.xlsx file to Google Drive
-    
-7.  In top left menu, click “File > Save as Google Sheets”
-    
-8.  Open that file and edit Sharing privileges to “Anyone with the link”
-    
-9.  E-mail the link to all first through third years, as well as the incoming first years. Standard communication templates are in the google drive.
-    
-10.  Unless you’ve made a mistake, stick to the standard schedule and resist rotation trades. Trading rotations has a ripple effect that throws the schedule out of balance in ways that are difficult to immediately appreciate. If absolutely necessary, consider only “vertical trades” (i.e., along the same column), but even this will throw off some of the multi-year logic that is built into the system.
-    
-11.  Expect some complaints about the schedule. Do not take these complaints personally.
-    
-12.  Once satisfied that there are no glaring errors, let the call and vacation chiefs know they can begin their end of things.
-    
-
-## To Leadership and Administrators
-
-E-mail the same google sheet to the program director, program coordinator, and all faculty.  Standard communication templates are in the google drive.
-
-## Setting up the Master Spreadsheet for next year’s rotation chief
-
-It used to be the case that the new rotation chief set up their own files. However, it honestly makes most sense for the seasoned rotation chief to just do this since they have presumably spent an inordinate amount of time looking at the file and are much more facile in setting things up.
-
-  
-
-1.  Locate the “Schedule Creation.xlsm” file you have been working on since at least March.
-    
-2.  Duplicate the file and rename it to match the year (e.g., “Schedule Creation 2026-2027.xlsm”). 
-    
-3.  Perform next steps on a workstation with a lot of processing power. It’ll be slow on an old laptop.
-    
-4.  Update the data for the new year. This must be done in a very specific way as described below, else you will break thousands of formulas that automate the rest of the spreadsheet.
-    
-
-1.  Select the tab labeled “Historical.”
-    
-2.  Select cells BG3 through HF200; click Edit > Copy.
-    
-3.  Select cell G3; click Edit > Paste Special > Values only.
-    
-4.  Select cells FG3 through HF200; Right-click > Clear Contents
-    
-5.  Identify the row corresponding to the first R3 resident. Lets call it row X. Select rows X through 200; click Edit > Copy (yes, include the empty cells). 
-    
-6.  Select cell A3; click Edit > Paste Special > Values only
-    
-7.  In Column B, add in the names of all incoming R1 (“LastName, FirstName”, alphabetical)
-    
-8.  In Column A, update PGY for everyone.
-    
-9.  Select “Base Schedule” tab, select cells D6 through BC100; click Edit > Copy.
-    
-10.  Return to “Historical” tab, select cell FG3 and click Edit > Paste Special > Values only
-    
-
-6.  Remove all manually entered data for prior year
-    
-
-1.  “Preferences” tab: select cells R3 through AA200; Right-click > “Clear Contents.”
-    
-2.  “Base Schedule” tab: select cells D6 through BC100; Right-click > “Clear Contents.”
-    
-3.  “Night Float” tab: select cell F103; click Edit > Copy. Select F7 through BE103; Edit > Paste Special > Formulas.
-    
-
-# Making Changes
-
-Unless absolutely necessary to avoid a complete meltdown, avoid making any big changes and stick rigorously to the standardized curriculum.
-
-# Miscellaneous Loose Ends
-
-1.  The rotation request forms contain the information needed to update resident profiles on the department website ([http://www.radiology.ucsf.edu/education/residency-programs/diagnostic/residents](http://www.radiology.ucsf.edu/education/residency-programs/diagnostic/residents)). Please send this information to Sandria Wong and ask her to update the page in late June or early July; she will either do it herself or forward the information along to one of the IT staff.
-    
-2.  Update this guide if things have changed. It’s your final task as rotation chief!

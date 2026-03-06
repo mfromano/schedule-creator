@@ -22,8 +22,9 @@ class ExcelWriter:
             output_path = self.source_path.parent / f"{stem}_output.xlsm"
         self.output_path = Path(output_path)
 
-        # Copy source to output
-        shutil.copy2(self.source_path, self.output_path)
+        # Copy source to output (skip if already the same file)
+        if self.source_path.resolve() != self.output_path.resolve():
+            shutil.copy2(self.source_path, self.output_path)
 
         # Open with keep_vba=True to preserve macros
         self._wb = openpyxl.load_workbook(
@@ -64,6 +65,7 @@ class ExcelWriter:
         assignments: dict[str, dict[int, str]],
         resident_row_map: dict[str, int],
         first_data_col: int = 4,  # Column D = 4
+        track_map: dict[str, int] | None = None,
     ) -> None:
         """Write rotation assignments to Base Schedule tab.
 
@@ -71,6 +73,7 @@ class ExcelWriter:
             assignments: {resident_name: {week_number: rotation_code}}
             resident_row_map: {resident_name: row_number} from read_base_schedule_structure
             first_data_col: first column of weekly data (D=4)
+            track_map: {resident_name: track_number} to write to column C
         """
         ws = self._wb["Base Schedule"]
 
@@ -79,6 +82,10 @@ class ExcelWriter:
             if row is None:
                 print(f"WARNING: No row found for resident {name}")
                 continue
+
+            # Write track number to column C
+            if track_map and name in track_map:
+                ws.cell(row=row, column=3, value=track_map[name])
 
             for week_num, code in weeks.items():
                 col = first_data_col + week_num - 1

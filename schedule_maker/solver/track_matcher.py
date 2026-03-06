@@ -57,6 +57,14 @@ def solve_track_assignment(
     for j in range(1, num_tracks + 1):
         model.add(sum(x[i, j] for i in range(n)) <= max_per_track)
 
+    # When n > num_tracks, ensure every track has at least 1 resident.
+    # This minimizes the number of duplicate tracks (exactly n - num_tracks),
+    # which is critical for Sx/Snf deconfliction since each duplicate track
+    # can only be fixed using a free (unassigned) track's Sx/Snf pattern.
+    if n > num_tracks:
+        for j in range(1, num_tracks + 1):
+            model.add(sum(x[i, j] for i in range(n)) >= 1)
+
     # Optional: max rank constraint
     if max_rank is not None:
         for i, res in enumerate(residents):

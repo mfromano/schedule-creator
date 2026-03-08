@@ -14,6 +14,8 @@ Comprehensive reference of all constraints implemented in the codebase.
 | ESIR | IR | 12 | Mir, Zir, Sir, Vir | Typical: R1=0, R2=Vir/Sir(2), R3=Zir/Mir(2), R4=Mir x8 |
 | ESNR | Neuro (R4) | 24 | Mucic, Smr | 6 blocks, max 1 on Smr |
 
+**ESNR Neuro Exempt**: `{"Anderies, Barrett"}` (`graduation.py:ESNR_NEURO_EXEMPT`, `r4_builder.py:ESNR_NEURO_EXEMPT`) — skips ESNR neuro graduation check and R4 neuro block placement.
+
 ## 2. Nuclear Medicine Partial Credit (`rotation.py`)
 
 - **Eligible rotations**: Mai, Mch, Mch2, Peds, Mx (`NM_PARTIAL_CREDIT_ROTATIONS`)
@@ -106,6 +108,7 @@ FSE codes are mapped to base codes for max checks (e.g., FSE-Bre counts against 
 - **Each resident**: exactly 1 track
 - **Max per track**: ceil(n / num_tracks) -- allows sharing when n > tracks
 - **Min per track**: 1 when n > num_tracks (minimizes duplicates for Sx/Snf deconfliction)
+- **Unranked penalty**: num_tracks (worst possible)
 - **Optional max_rank**: hard limit on worst allowed rank
 - **Time limit**: 30 seconds
 
@@ -145,12 +148,15 @@ FSE codes are mapped to base codes for max checks (e.g., FSE-Bre counts against 
 - Staffing-aware scoring: blocks with highest deficit preferred (via `get_staffing_need`)
 - Hospital conflict check at block level
 - Section preferences influence rotation ordering
+- Run penalty weight: 3.0 (`_RUN_PENALTY_WEIGHT`) — discourages consecutive same-rotation blocks (except NRDR Mnuc)
 - Schedule weight bonus: front-heavy (+1.0 if block <= 6, -0.5 if block >= 10), back-heavy (+1.0 if block >= 8, -0.5 if block <= 4)
 - Remaining blocks filled via `rank_rotations_by_combined_score` with staffing_weight=2, pref_weight=3
+- No IR rotations (Zir, Vir, Sir) on blocks that already have NF assigned (`block_has_nf`)
 
 ## 11. R4 Builder (`r4_builder.py`)
 
 ### Research/CEP Placement
+- **Authoritative source**: `.claude/rules/cep.md` lists all approved CEP/Research blocks for the year. Residents not listed get zero blocks. Parsed by `cep_parser.py`, which zeroes all R4 CEP/Research counts then applies only listed approvals.
 - Avoid blocks 5-7 (RSNA/LC area)
 - Preferred blocks: 3, 4, 8, 9, 10, 11, 2, 12
 - Max 2 months research/CEP unless supplementary funding
@@ -164,13 +170,25 @@ FSE codes are mapped to base codes for max checks (e.g., FSE-Bre counts against 
 
 ### ESNR R4
 - 6 blocks neuro total, max 1 on Smr (rest on Mucic)
+- **Exempt**: `ESNR_NEURO_EXEMPT = {"Anderies, Barrett"}` — skips ESNR neuro placement
 
 ### FSE Rules
 - Breast FSE: 6 months (no exception)
 - Other FSE: 2 blocks typical
 - ALL FSE specialties processed (not just first)
-- FSE codes mapped via `_fse_to_rotation_code` using `SECTION_TO_ROTATION_CODES`
+- FSE codes mapped via `_fse_to_rotation_code` using `SECTION_TO_ROTATION_CODES` + `_FSE_NAME_ALIASES` for full form names (e.g. "Abdominal Imaging" -> "AI" -> "Mai", "Interventional Radiology" -> "IR" -> "Mir")
 - Hospital conflict exempt residents can skip conflict check for FSE rotations
+
+### _FSE_NAME_ALIASES
+- "abdominal imaging" -> "AI"
+- "interventional radiology" -> "IR"
+- "neuroradiology" -> "Neuro"
+- "nuclear medicine" -> "NucMed"
+- "musculoskeletal" -> "MSK"
+- "chest/cardiac" -> "Chest"
+- "breast imaging" -> "Breast"
+- "ultrasound" -> "US"
+- "pediatrics" -> "Peds"
 
 ### Mx Rules
 - All R4s get Mx blocks except T32 or dual-pathway residents
@@ -189,6 +207,7 @@ FSE codes are mapped to base codes for max checks (e.g., FSE-Bre counts against 
 - Combined score: staffing_weight(2) * need + pref_weight(3) * preference
 - FSE rotation codes boosted to pref_weight=5 and max score=3
 - Schedule weight bonus applied during grad requirement fill
+- No IR rotations on blocks that already have NF assigned (`block_has_nf`)
 
 ## 12. T32 Rules (`r4_builder.py`)
 
@@ -225,6 +244,10 @@ FSE codes are mapped to base codes for max checks (e.g., FSE-Bre counts against 
 ### NF Recs Override
 - `NFRules.from_nf_recs()` parses NF Recs tab data (PGY-3/4/5 rows)
 - Columns: mnf_1wk, mnf_2wk, snf2_1wk, snf2_2wk counts
+- Stores raw census as `r2_mnf_census`, `r3_mnf_census`, `r3_snf2_census`, `r4_snf2_census` tuples of (count_1wk, count_2wk)
+- **Critical**: `from_nf_recs()` must NOT store class totals in per-resident fields (`r2_mnf_weeks`, `r3_max_nf`, `r3_mnf_max`, `r3_snf2_max`, `r4_snf2_weeks`). Those fields are per-resident limits used only in fallback mode. Census data drives solver distribution constraints instead.
+- Census data used by solver for aggregate class-level distribution constraints
+- Always loaded in single-step build mode (not gated by `prefs_path`)
 
 ## 14. NF Solver (`nf_solver.py`)
 
@@ -234,18 +257,26 @@ FSE codes are mapped to base codes for max checks (e.g., FSE-Bre counts against 
 3. **Eligibility**: R2 -> Mnf only (Snf2 forbidden), R4 -> Snf2 only (when r4_mnf_weeks=0), R3 -> both
 4. **No NF adjacent to existing Sx/Mnf/Snf2** in base schedule (Snf excluded -- paired with Sx by design)
 5. **No Mnf during Vb**: hard constraint
-6. **Staffing hard constraint**: forbid NF if pulling would drop rotation below minimum staffing (current <= min_req)
-7. **Locked assignments**: pre-assigned NF must be respected
-8. **Total NF counts**: R2 Mnf == r2_mnf_weeks, R3 total <= r3_max_nf (>= 1), R4 Snf2 == r4_snf2_weeks
+6. **No NF (Mnf or Snf2) during IR rotations (Zir, Vir, Sir)**: hard constraint
+7. **No NF on existing Sx/Snf weeks**: hard constraint (prevents stacking solver NF on top of track-assigned call/NF)
+8. **No NF for R4 on CEP/Research weeks**: forbid both Mnf and Snf2 when R4 has CEP or Res in base schedule
+9. **Staffing hard constraint**: forbid NF if pulling would drop rotation below minimum staffing (current < min_req)
+10. **Locked assignments**: pre-assigned NF must be respected
+11. **Total NF counts**: R2/R3/R4 use census-based distribution when available (see below); fallback to per-resident limits (R2 Mnf == r2_mnf_weeks, R3 total <= r3_max_nf >= 1, R4 Snf2 == r4_snf2_weeks)
+12. **Census-based R2 distribution** (when `r2_mnf_census` nonzero): each R2 gets either 2-Mnf or 1-Mnf via boolean var; aggregate count of 2-Mnf residents == `r2_mnf_census[1]`
+13. **Census-based R3 distribution** (when `r3_mnf_census` nonzero): each R3 is assigned to either 2-Mnf/1-Snf2 or 1-Mnf/2-Snf2 pattern via boolean var; aggregate count of 2-Mnf residents == `r3_mnf_census[1]`
+14. **Census-based R4 distribution** (when `r4_snf2_census` nonzero): each R4 gets either 2-Snf2 or 1-Snf2 via boolean var; aggregate count of 2-Snf2 residents == `r4_snf2_census[1]`
 
 ### Soft Constraints (Objective Penalties)
 | Penalty | Weight | Trigger |
 |---------|--------|---------|
 | No-call weeks | 20 (`no_call_penalty_weight`) | NF assigned on resident's no-call week |
-| Staffing near-minimum | 20 (`staffing_penalty_weight`) | Pulling from rotation at min+1 staffing |
+| Staffing at minimum | 2 x 20 (`staffing_penalty_weight`) | Pulling from rotation at exactly min staffing (current == min_req) |
+| Staffing near-minimum | 1 x 20 (`staffing_penalty_weight`) | Pulling from rotation at min+1 staffing |
 | Holiday non-preference | 5 (`holiday_penalty_weight`) | NF on holiday resident doesn't prefer to work |
 | Holiday history | 5 | NF on holiday resident worked in prior year |
 | No-call weekend buffer | 3 (`nocall_buffer_weight`) | NF on weeks adjacent to no-call dates |
+| Snf spacing proximity | 3 (`nocall_buffer_weight`) | Solver-assigned NF within min_spacing_weeks of existing R2 track Snf |
 | NF timing preference | 3 (`nf_timing_weight`) | NF in unpreferred timing window (from comments) |
 
 ### NF Timing Preference Details
@@ -260,7 +291,7 @@ FSE codes are mapped to base codes for max checks (e.g., FSE-Bre counts against 
 
 ### Solver Parameters
 - **Time limit**: 60 seconds
-- **Objective**: maximize pull_bonus - staffing_penalties - no_call_penalties - holiday_penalties - buffer_penalties - timing_penalties
+- **Objective**: maximize pull_bonus - staffing_penalties - no_call_penalties - holiday_penalties - buffer_penalties - timing_penalties - snf_spacing_penalties
 
 ## 15. NF Pre-locking (`night_float.py`)
 
@@ -284,35 +315,28 @@ Holidays mapped to week numbers for NF soft constraints:
 - **Dedup**: large penalty (-100) prevents same rotation appearing in multiple sampler blocks
 - Top 2 distinct rotations chosen per block
 - Groups split at schedule block boundaries
+- **Pref-to-rotation map**: "Msk" -> "Mb"
+- **IR inclusion**: IR rotations (Nir, Mir) included conditionally only when no pool rotation is understaffed; max 1 IR per block
 
 ## 18. Comment-Derived Soft Constraints (`main.py` apply_comment_overrides)
 
-Extra no-call dates: Moushey (7/11-8/1 wedding/honeymoon), Liu (9/12-9/19 vacation, 12/18-12/20 wedding), Marsh (12/25 Christmas), Talebi (8/14-8/15, 9/3-9/5, 10/8-10/12 wedding parties)
-Section pref boosts: Boddu (Smr+2), Yu (Smr/Pcbi/Mai/Mb+1), Hu (Smr/Mch/Mb+1), Bermudez (Pcbi/Mnuc+1), Deshpande (Mai/Smr/Mb/Ser/Peds+1)
-NF timing: Moushey=avoid-july, Chan=early-holidays-ok, Marsh=late-fall, Diwanji=avoid-core-adjacent, Rincon-Hekking=late, Talebi=holidays-ok
-Schedule weight: Chan/Garigipati=front-heavy, Marsh/Rincon-Hekking=back-heavy
+Extra no-call dates: Moushey (7/10-7/11 wedding), Talebi (8/14-8/15, 9/3-9/5, 10/8-10/12 wedding parties), Liu (9/12-9/19 vacation, 12/18-12/20 wedding), Garigipati (12/14-12/18 wedding), Lue (12/14-12/18 wedding), Marsh (12/25 Christmas)
+Section pref boosts: Boddu (Smr+2), Yu (Smr/Pcbi/Mai/Mb+1), Hu (Smr/Mch/Mb+1), Bermudez Garolera (Pcbi/Mnuc+1), Deshpande (Mai/Smr/Mb/Ser/Peds+1), Chan Kaelan (Smr/Mb+1), Ding (Mucic/Smr+1)
+NF timing: Moushey=avoid-july, Chan Shin Mei=early-holidays-ok, Marsh=late-fall, Diwanji=avoid-core-adjacent, Rincon-Hekking=late, Talebi=holidays-ok
+Schedule weight: Chan Shin Mei/Garigipati/Liu=front-heavy, Marsh/Rincon-Hekking=back-heavy
 Block requests: Stahl CEP Block 2, Deshpande CEP Block 9
 Pathway/FSE org pref: parsed from form cols 60/63, weight=0.3 (lowest)
 
-## 19. Research Overrides (`main.py`)
+## 19. Research Overrides
 
-Manual research month assignments (2025-2026):
-- Yu, Theresa: 1 month
-- Boddu, Priyanka: 1 month
-- Hu, Anne: 1 month
-- Deshpande, Nikita: 1 month
-- Chan, Kaelan: 1 month
-- Moushey, Alexander: 1 month
-- Sivanushanthan, Shan: 1 month
-- Ding, Kevin: 2 months
-- Morkos, John: 2 months
+CEP/Research approvals are now handled entirely via `.claude/rules/cep.md` (see Section 11). The cep.md file zeroes all R4 CEP/Research counts first, then applies only the listed approvals. Residents not listed get zero blocks regardless of form responses.
 
 ## 20. Phase Ordering (`main.py`)
 
 1. Load data (roster, history, tracks, staffing constraints, NF Recs)
 2. Parse preferences (from file or Preferences tab)
 3. Load R3-4 Recs **AFTER** preferences (authoritative for pathway flags, overwrites with `=`)
-4. Apply manual research overrides
+4. Apply CEP/Research from `.claude/rules/cep.md` (overrides form-derived values)
 5. Apply comment-derived overrides
 6. R1 track assignment
 7. R2 track assignment + Sx/Snf deconfliction
@@ -344,14 +368,22 @@ FSE specialty abbreviations map to base rotation codes for staffing:
 
 ### Combined Scoring
 - `rank_rotations_by_combined_score`: staffing_weight(2) * need + pref_weight(3) * pref_score
-- `get_staffing_need`: full deficit if understaffed, -0.25 per extra resident if overstaffed
+- `get_staffing_need`: full deficit if understaffed, deficit * 0.25 if overstaffed (dampened)
 - `block_exceeds_max`: checks per-week against ROTATION_MAXIMUMS with FSE mapping
+
+### Run Penalty
+- Weight: 1.0 per adjacent block with same rotation code (`staffing_utils.py:compute_run_penalty`)
+- R3 builder applies multiplier of 3.0 (`_RUN_PENALTY_WEIGHT`)
+- Exception: NRDR R3 Mnuc (no penalty for consecutive)
 
 ### Fill Candidates
 - Base list: Mai, Mch, Mus, Mucic, Mb, Ser
 - Expanded with all rotation codes from staffing constraints
 - Excluded codes: Res, CEP, AIRP, LC, Mx, Sx, Snf, Snf2, Mnf, Msamp, Msampler, SSamplerCh2, Vch, Vn, Vnuc
 - Filtered by year eligibility when r_year specified
+
+### No IR on NF Blocks
+- IR rotations (Zir, Vir, Sir) are not assigned to blocks that already have NF in the resident's schedule or grid NF overlay (`block_has_nf`)
 
 ## 23. Preference Parsing Safety (`prefs_parser.py`)
 
@@ -362,6 +394,39 @@ FSE specialty abbreviations map to base rotation codes for staffing:
 - R3-4 Recs is authoritative for pathways and runs AFTER preferences to overwrite with `=`
 
 ### FSE Negative Response Filtering (`_is_negative_fse`)
-- Responses containing words like "no", "none", "n/a", "not", "don't", "do not" are treated as blank (no FSE preference)
+- Full-string match: entire response must be a negative phrase (not word-boundary matching)
+- Matches: "no", "none", "n/a", "na", "not applicable", "not interested", "no preference", "no thanks", "i do not want...", "i don't want...", "no, thank...", "not at this time..."
+- Pattern: `^(no|none|n/?a|na|not applicable|not interested|no preference|no thanks|i do not want.*|i don'?t want.*|no,?\s*thank.*|not at this time.*)$` (case-insensitive)
 - Applies to both dict-based (`_parse_r4_rotations`) and column-index (`_parse_combined_r4`) FSE parsing paths
-- Pattern: `\b(no|none|n/a|not|don'?t|do not)\b` (case-insensitive)
+
+## 24. Section Mapping (`rotation.py` ROTATION_SECTION)
+
+| Rotation Codes | Section |
+|---------------|---------|
+| Mnuc, Snct, Mnct | NM |
+| Pcbi, Sbi | BI |
+| Smr | NR |
+| Zai, Mai, Sai | AI |
+| Mus, Sus | US |
+| Mch, Mch2, Sch | CH |
+| Mb, Vb, Ser, Mucic | MSK |
+| Peds | PD |
+| Mir, Zir, Sir, Vir | IR |
+| Mx, Mc | ADMIN |
+
+## 25. SECTION_TO_ROTATION_CODES (`rotation.py`)
+
+Maps section abbreviations to rotation code lists for FSE and fill logic:
+
+| Section | Rotation Codes |
+|---------|---------------|
+| AI | Mai, Zai |
+| Breast | Pcbi, Sbi |
+| Cardiac | Mch |
+| Chest | Mch |
+| MSK | Mb, Ser |
+| Neuro | Mucic |
+| Peds | Peds |
+| US | Mus |
+| NucMed | Mnuc |
+| IR | Mir, Zir |

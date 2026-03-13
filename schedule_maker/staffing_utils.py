@@ -2,10 +2,63 @@
 
 from __future__ import annotations
 
+import math
+import random as _random
+
 from schedule_maker.models.schedule import ScheduleGrid
 from schedule_maker.models.rotation import fse_to_base_code
 from schedule_maker.models.constraints import StaffingConstraint
 from schedule_maker.validation.staffing import ROTATION_MINIMUMS, ROTATION_MAXIMUMS
+
+
+def weighted_sample_top_k(
+    ranked: list[tuple[str, float]],
+    k: int,
+    rng: _random.Random,
+    temperature: float = 1.0,
+) -> tuple[str, float]:
+    """Sample from top K candidates using softmax-weighted probabilities.
+
+    Converts scores to probabilities via softmax, then samples one item.
+    Higher scores → higher probability. Temperature controls exploration:
+    - temperature=1.0: standard softmax
+    - temperature>1.0: more uniform (more exploration)
+    - temperature<1.0: more peaked (closer to argmax)
+
+    Args:
+        ranked: List of (code, score) tuples, sorted descending by score.
+        k: Number of top candidates to consider.
+        rng: Random number generator.
+        temperature: Softmax temperature (default 1.0).
+
+    Returns:
+        Selected (code, score) tuple.
+    """
+    if not ranked:
+        raise ValueError("ranked list cannot be empty")
+    if k <= 0:
+        raise ValueError("k must be positive")
+
+    # Take top K
+    top_k = ranked[:min(k, len(ranked))]
+    if len(top_k) == 1:
+        return top_k[0]
+
+    # Compute softmax probabilities with numerical stability
+    scores = [s for _, s in top_k]
+    max_score = max(scores)
+    exp_scores = [math.exp((s - max_score) / temperature) for s in scores]
+    total = sum(exp_scores)
+    probs = [e / total for e in exp_scores]
+
+    # Sample using cumulative distribution
+    r = rng.random()
+    cumulative = 0.0
+    for i, p in enumerate(probs):
+        cumulative += p
+        if r <= cumulative:
+            return top_k[i]
+    return top_k[-1]  # fallback for floating point edge case
 
 
 def _build_code_to_groups(
@@ -25,6 +78,13 @@ def _build_code_to_groups(
                 continue
             for c in sc.rotation_codes:
                 code_to_groups.setdefault(c, []).append((sc.rotation_codes, sc.min_count))
+        # Merge any ROTATION_MINIMUMS entries whose codes aren't covered
+        # by the dynamic constraints, so rotations like Mus still get
+        # staffing-need signal even when the Excel doesn't list them.
+        for _label, (codes, min_req) in ROTATION_MINIMUMS.items():
+            if not any(c in code_to_groups for c in codes):
+                for c in codes:
+                    code_to_groups.setdefault(c, []).append((codes, min_req))
     else:
         for _label, (codes, min_req) in ROTATION_MINIMUMS.items():
             for c in codes:
@@ -86,6 +146,53 @@ def rank_rotations_by_need(
 
     scored.sort(key=lambda x: -x[1])
     return scored
+
+
+def _count_blocks_with_code(schedule: dict[int, str], code: str, grid: ScheduleGrid) -> int:
+    """Count how many distinct blocks already have ``code`` assigned."""
+    count = 0
+    for b in range(1, 14):
+        for w in grid.block_to_weeks(b):
+            if schedule.get(w) == code:
+                count += 1
+                break
+    return count
+
+
+def compute_run_penalty(schedule: dict[int, str], block: int, code: str, grid: ScheduleGrid) -> float:
+    """Return penalty if assigning code to block creates consecutive same-rotation runs
+    or excessive repeats of the same rotation across the schedule."""
+    penalty = 0.0
+    # Adjacent-block penalty (consecutive run)
+    for adj_block in (block - 1, block + 1):
+        if adj_block < 1 or adj_block > 13:
+            continue
+        for w in grid.block_to_weeks(adj_block):
+            if schedule.get(w) == code:
+                penalty += 1.0
+                break
+    # Repeat-count penalty: escalating discouragement for 3+ blocks of same rotation
+    existing_count = _count_blocks_with_code(schedule, code, grid)
+    if existing_count >= 2:
+        penalty += 0.5 * (existing_count - 1)
+    return penalty
+
+
+def block_has_nf(schedule: dict[int, str], block: int, grid: ScheduleGrid,
+                 resident_name: str | None = None) -> bool:
+    """Check if any week in block already has NF assigned.
+
+    Checks both the resident's schedule dict and the grid's NF overlay,
+    since NF assignments are stored separately in ``grid.nf_assignments``
+    and may not be reflected in ``res.schedule``.
+    """
+    nf_codes = {"Mnf", "Snf2", "Snf"}
+    for w in grid.block_to_weeks(block):
+        if schedule.get(w) in nf_codes:
+            return True
+        if resident_name and (resident_name, w) in grid.nf_assignments:
+            return True
+    return False
 
 
 def block_exceeds_max(grid: ScheduleGrid, block: int, code: str, default_max: int = 6) -> bool:
@@ -174,6 +281,7 @@ _ROTATION_YEAR_ELIGIBILITY: dict[str, set[int]] = {
     "Zir": {3, 4},
     "Zai": {2},
     "Mnct": {1},
+    "Peds": {2, 3, 4},
     "Vnuc": set(),  # retired rotation — never assign
 }
 
@@ -193,7 +301,7 @@ def build_fill_candidates(
     from schedule_maker.models.rotation import is_night_float
 
     excluded = {"Res", "CEP", "AIRP", "LC", "Mx", "Sx", "Snf", "Snf2", "Mnf",
-                "Msamp", "Msampler", "SSamplerCh2",
+                "Msamp", "Msampler",
                 "Vch", "Vn", "Vnuc"}  # retired rotations
     candidates = list(base or ["Mai", "Mch", "Mus", "Mucic", "Mb", "Ser"])
     if constraints:

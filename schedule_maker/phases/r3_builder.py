@@ -2,15 +2,22 @@
 
 from __future__ import annotations
 
+import random as _random
+
 from schedule_maker.models.resident import Resident
 from schedule_maker.models.schedule import ScheduleGrid
-from schedule_maker.models.rotation import get_hospital_system, HospitalSystem
+from schedule_maker.models.rotation import get_hospital_system, get_same_section_codes, HospitalSystem
 from schedule_maker.models.constraints import StaffingConstraint
 from schedule_maker.staffing_utils import (
     rank_rotations_by_need, rank_rotations_by_combined_score,
     block_exceeds_max, build_fill_candidates,
+    compute_run_penalty, block_has_nf,
     _ROTATION_YEAR_ELIGIBILITY,
 )
+
+_RUN_PENALTY_WEIGHT = 8.0
+_FILL_NOISE_SIGMA = 0.5
+_IR_CODES = {"Zir", "Vir", "Sir"}
 
 
 MAX_PER_AIRP_SESSION = 4
@@ -34,34 +41,30 @@ def _has_hospital_conflict(schedule: dict[int, str], block: int, code: str) -> b
     return False
 
 
-def _build_airp_sessions(residents: list[Resident]) -> dict[str, tuple[int, str]]:
+def _build_airp_sessions(residents: list[Resident]) -> dict[str, list[int]]:
     """Build AIRP sessions from resident preferences.
 
-    Session ID = block number (read from Preferences col Y / airp_prefs.rankings).
-    Returns {session_id: (block_number, description)}.
+    Returns {session_id: [week_numbers]}, built from the session_weeks
+    data populated during preference parsing.
     """
-    sessions: dict[str, tuple[int, str]] = {}
+    sessions: dict[str, list[int]] = {}
     for res in residents:
-        if res.airp_prefs and res.airp_prefs.rankings:
-            for session_id in res.airp_prefs.rankings:
+        if res.airp_prefs and res.airp_prefs.session_weeks:
+            for session_id, weeks in res.airp_prefs.session_weeks.items():
                 if session_id not in sessions:
-                    try:
-                        block = int(session_id)
-                        sessions[session_id] = (block, f"Block {block}")
-                    except ValueError:
-                        pass
+                    sessions[session_id] = weeks
     return sessions
 
 
 def assign_airp(
     residents: list[Resident],
     grid: ScheduleGrid,
-    sessions: dict | None = None,
+    sessions: dict[str, list[int]] | None = None,
 ) -> dict[str, str]:
     """Assign R3s to AIRP sessions based on preferences.
 
-    If sessions is None, builds session list from resident AIRP preferences
-    (session ID = block number).
+    If sessions is None, builds session list from resident AIRP preferences.
+    Sessions map session_id → list of week numbers.
 
     Returns {resident_name: session_id} assignments.
     """
@@ -124,10 +127,11 @@ def assign_airp(
         if not res.airp_prefs or not res.airp_prefs.rankings:
             continue
 
-        # Resolve group requests to canonical names
+        # Resolve group requests to canonical names and store back
         resolved_groupmates: list[str] = []
         if res.airp_prefs.group_requests:
             resolved_groupmates = _resolve_groupmates(res.airp_prefs.group_requests)
+            res.airp_prefs.group_requests = resolved_groupmates
 
         # Score each eligible session: preference rank + groupmate bonus
         ranked = res.airp_prefs.rankings
@@ -151,8 +155,7 @@ def assign_airp(
         if best_session is not None:
             session_counts[best_session] += 1
             assignments[res.name] = best_session
-            block = sessions[best_session][0]
-            for w in grid.block_to_weeks(block):
+            for w in sessions[best_session]:
                 grid.assign(res.name, w, "AIRP")
                 res.schedule[w] = "AIRP"
             assigned = True
@@ -162,10 +165,20 @@ def assign_airp(
             least = min(session_counts, key=lambda k: session_counts[k])
             session_counts[least] += 1
             assignments[res.name] = least
-            block = sessions[least][0]
-            for w in grid.block_to_weeks(block):
+            for w in sessions[least]:
                 grid.assign(res.name, w, "AIRP")
                 res.schedule[w] = "AIRP"
+
+    # Second pass: assign R3s who had no AIRP rankings to least-full session
+    for res in r3s:
+        if res.name in assignments:
+            continue
+        least = min(session_counts, key=lambda k: session_counts[k])
+        session_counts[least] += 1
+        assignments[res.name] = least
+        for w in sessions[least]:
+            grid.assign(res.name, w, "AIRP")
+            res.schedule[w] = "AIRP"
 
     return assignments
 
@@ -232,19 +245,53 @@ def fill_r3_clinical(
     residents: list[Resident],
     grid: ScheduleGrid,
     staffing_constraints: list[StaffingConstraint] | None = None,
+    rng: _random.Random | None = None,
+    shuffle_residents: bool = False,
+    shuffle_blocks: bool = False,
+    top_k_sample: int = 1,
 ) -> dict[str, dict]:
     """Fill R3 graduation requirements + remaining empty blocks.
 
     Should be called after NF is placed so staffing-aware rotation
     choices account for NF absences.
 
+    Args:
+        rng: Optional random number generator for stochastic scoring.
+             When provided, small Gaussian noise is added to scores at
+             decision points, enabling multi-trial optimization.
+        shuffle_residents: Randomize resident processing order within
+             pathway groups (NRDR always first for Mnuc cap constraints).
+        shuffle_blocks: Randomize block processing order within
+             schedule weight groups.
+        top_k_sample: Sample from top K rotations instead of picking
+             the single best. Set to 1 for deterministic behavior.
+
     Returns per-resident schedule metadata.
     """
     r3s = [r for r in residents if r.r_year == 3]
+    # Process NRDR R3s first — they need 6 blocks Mnuc against a cap of 5/week
+    nrdr_r3s = [r for r in r3s if r.is_nrdr]
+    non_nrdr_r3s = [r for r in r3s if not r.is_nrdr]
+
+    if shuffle_residents and rng:
+        rng.shuffle(nrdr_r3s)
+        rng.shuffle(non_nrdr_r3s)
+    else:
+        nrdr_r3s.sort(key=lambda r: r.name)
+        non_nrdr_r3s.sort(key=lambda r: r.name)
+
+    r3s = nrdr_r3s + non_nrdr_r3s
+
     metadata = {}
     for res in r3s:
-        req_filled = _fill_r3_requirements(res, grid, staffing_constraints)
-        remaining_filled = _fill_r3_remaining(res, grid, staffing_constraints)
+        req_filled = _fill_r3_requirements(
+            res, grid, staffing_constraints, rng=rng,
+            shuffle_blocks=shuffle_blocks, top_k_sample=top_k_sample,
+        )
+        remaining_filled = _fill_r3_remaining(
+            res, grid, staffing_constraints, rng=rng,
+            shuffle_blocks=shuffle_blocks, top_k_sample=top_k_sample,
+        )
         metadata[res.name] = {
             "filled_blocks": {**req_filled, **remaining_filled},
         }
@@ -285,12 +332,15 @@ def _fill_r3_requirements(
     res: Resident,
     grid: ScheduleGrid,
     staffing_constraints: list[StaffingConstraint] | None = None,
+    rng: _random.Random | None = None,
+    shuffle_blocks: bool = False,
+    top_k_sample: int = 1,
 ) -> dict[int, str]:
     """Fill remaining empty blocks for an R3 resident with required rotations.
 
-    Iterates rotation-first: for each needed rotation, find the best
-    available block.  This avoids dropping rotations when a single block
-    has a hospital-system conflict.
+    Uses block-first iteration so rotations from recommended_blocks are
+    interleaved naturally rather than placing all N blocks of rotation X
+    before any blocks of rotation Y.
 
     Respects:
     - Hospital system conflicts
@@ -298,14 +348,19 @@ def _fill_r3_requirements(
     - Zir block preferences
     - NRDR/ESIR/ESNR/T32 pathway requirements
     - Staffing need (prefers blocks with the largest deficit for a rotation)
+
+    Args:
+        shuffle_blocks: Randomize block order within schedule weight groups.
+        top_k_sample: Sample from top K rotations instead of best.
     """
+    from schedule_maker.staffing_utils import weighted_sample_top_k
     filled = {}
 
     # Get available blocks (not yet assigned)
     available_blocks = []
     for block in range(1, 14):
         weeks = list(grid.block_to_weeks(block))
-        if not any(res.schedule.get(w) for w in weeks):
+        if not all(res.schedule.get(w) for w in weeks):
             available_blocks.append(block)
 
     # Determine LC block
@@ -316,27 +371,18 @@ def _fill_r3_requirements(
             lc_block = block
             break
 
-    # Build priority rotation list from recommended_blocks
-    needed_rotations: list[str] = []
-    for rotation, count in sorted(res.recommended_blocks.items(),
-                                   key=lambda x: -x[1]):
+    # Build remaining_counts from recommended_blocks
+    remaining_counts: dict[str, int] = {}
+    for rotation, count in res.recommended_blocks.items():
         if rotation in _ROTATION_YEAR_ELIGIBILITY and 3 not in _ROTATION_YEAR_ELIGIBILITY[rotation]:
             continue
-        blocks_needed = max(1, round(count))
-        for _ in range(blocks_needed):
-            needed_rotations.append(rotation)
+        remaining_counts[rotation] = max(1, round(count))
 
-    # Also add deficient sections not already covered
-    for section in res.deficient_sections:
-        if section not in needed_rotations:
-            needed_rotations.append(section)
+    # Cap Zir to 1 block per R3
+    if "Zir" in remaining_counts:
+        remaining_counts["Zir"] = min(remaining_counts["Zir"], 1)
 
-    # Sort needed rotations by section preference (preferred first, bottom last)
-    if res.section_prefs and res.section_prefs.scores:
-        _pref_scores = res.section_prefs.scores
-        needed_rotations.sort(key=lambda r: -_pref_scores.get(r, 0))
-
-    # Runtime breast deficit — ensure Pcbi is in needed_rotations with correct count
+    # Breast deficit — Pcbi gets large priority bonus
     breast_codes = {"Pcbi", "Sbi"}
     breast_total = sum(res.history.get(c, 0) for c in breast_codes)
     for w, code in res.schedule.items():
@@ -345,79 +391,137 @@ def _fill_r3_requirements(
     breast_deficit_weeks = max(0, 12 - breast_total)
     breast_blocks_needed = -(-breast_deficit_weeks // 4)  # ceil division
     if breast_blocks_needed > 0:
-        existing_pcbi = needed_rotations.count("Pcbi")
-        for _ in range(breast_blocks_needed - existing_pcbi):
-            needed_rotations.insert(0, "Pcbi")  # high priority
+        remaining_counts["Pcbi"] = max(remaining_counts.get("Pcbi", 0), breast_blocks_needed)
 
-    # NRDR: need 6 blocks Mnuc
+    # NRDR: need 6 blocks Mnuc (large priority bonus applied in scoring)
     if res.is_nrdr:
-        mnuc_needed = 6 - needed_rotations.count("Mnuc")
-        for _ in range(max(0, mnuc_needed)):
-            needed_rotations.insert(0, "Mnuc")
+        remaining_counts["Mnuc"] = max(remaining_counts.get("Mnuc", 0), 6)
+
+    # Add deficient sections (low priority — 1 block each if not already in pool)
+    from schedule_maker.models.rotation import ROTATION_SECTION
+    for section in res.deficient_sections:
+        code = section
+        if code not in ROTATION_SECTION:
+            continue
+        if code in _ROTATION_YEAR_ELIGIBILITY and 3 not in _ROTATION_YEAR_ELIGIBILITY[code]:
+            alternatives = get_same_section_codes(code)
+            eligible = [c for c in alternatives
+                        if c not in _ROTATION_YEAR_ELIGIBILITY or 3 in _ROTATION_YEAR_ELIGIBILITY[c]]
+            code = eligible[0] if eligible else None
+        if code and code not in remaining_counts:
+            remaining_counts[code] = 1
 
     # Build code→groups map for staffing-aware block scoring
     from schedule_maker.staffing_utils import _build_code_to_groups, get_staffing_need
     code_to_groups = _build_code_to_groups(staffing_constraints, r_year=3)
 
-    # Cap Zir to 1 block per R3
-    zir_entries = [i for i, r in enumerate(needed_rotations) if r == "Zir"]
-    for idx in zir_entries[1:]:
-        needed_rotations[idx] = None  # type: ignore[assignment]
-    needed_rotations = [r for r in needed_rotations if r is not None]
+    # Sort available blocks by schedule weight preference
+    # When shuffle_blocks is enabled, shuffle within schedule weight groups
+    if shuffle_blocks and rng:
+        early = [b for b in available_blocks if b <= 6]
+        mid = [b for b in available_blocks if 6 < b < 10]
+        late = [b for b in available_blocks if b >= 10]
+        rng.shuffle(early)
+        rng.shuffle(mid)
+        rng.shuffle(late)
+        if res.schedule_weight == "back-heavy":
+            sorted_blocks = late + mid + early
+        elif res.schedule_weight == "front-heavy":
+            sorted_blocks = early + mid + late
+        else:
+            sorted_blocks = early + mid + late
+    elif res.schedule_weight == "back-heavy":
+        sorted_blocks = sorted(available_blocks, reverse=True)
+    else:
+        sorted_blocks = sorted(available_blocks)
 
-    # Assign rotations to available blocks (rotation-first iteration)
-    used_blocks: set[int] = set()
     zir_placed = False
-    for code in needed_rotations:
-        if code == "Zir" and zir_placed:
-            continue
 
-        # Collect eligible blocks with their staffing scores
-        eligible: list[tuple[int, float]] = []
-        for block in available_blocks:
-            if block in used_blocks:
+    # Block-first iteration: for each block pick best rotation from remaining pool
+    for block in sorted_blocks:
+        if not any(v > 0 for v in remaining_counts.values()):
+            break
+
+        scored_rotations: list[tuple[str, float]] = []
+
+        for rotation, remaining in remaining_counts.items():
+            if remaining <= 0:
                 continue
 
-            # No Zir in the block immediately before LC or later
-            if code == "Zir" and lc_block and block >= lc_block - 1:
+            # Zir constraints
+            if rotation == "Zir":
+                if zir_placed:
+                    continue
+                if not _block_fully_available(res, grid, block):
+                    continue
+                if lc_block and block >= lc_block - 1:
+                    continue
+
+            if _has_hospital_conflict(res.schedule, block, rotation):
                 continue
 
-            if _has_hospital_conflict(res.schedule, block, code):
+            # NRDR Mnuc: graduation requirement takes precedence over max cap
+            if block_exceeds_max(grid, block, rotation) and not (res.is_nrdr and rotation == "Mnuc"):
                 continue
 
-            if block_exceeds_max(grid, block, code):
+            # No IR on blocks with existing NF assignments
+            if rotation in _IR_CODES and block_has_nf(res.schedule, block, grid, resident_name=res.name):
                 continue
 
-            # Score by staffing need (higher = more understaffed)
             score = 0.0
 
-            # Zir block preferences: soft bonus instead of hard filter
-            zir_bonus = 0.0
-            if code == "Zir" and res.zir_prefs and res.zir_prefs.preferred_blocks:
+            # Preference bonus
+            pref_score = res.section_prefs.scores.get(rotation, 0) if res.section_prefs else 0
+            score += 1.0 * pref_score
+
+            # Zir block preferences: soft bonus
+            if rotation == "Zir" and res.zir_prefs and res.zir_prefs.preferred_blocks:
                 if block in res.zir_prefs.preferred_blocks:
-                    zir_bonus = 2.0
+                    score += 2.0
+
+            # NRDR Mnuc and breast deficit: large priority bonuses
+            if res.is_nrdr and rotation == "Mnuc":
+                score += 20.0
+            if rotation in ("Pcbi", "Sbi") and breast_blocks_needed > 0:
+                score += 20.0
 
             # Schedule weight bonus from comments
-            weight_bonus = 0.0
             if res.schedule_weight == "front-heavy":
-                weight_bonus = 1.0 if block <= 6 else (-0.5 if block >= 10 else 0.0)
+                score += 1.0 if block <= 6 else (-0.5 if block >= 10 else 0.0)
             elif res.schedule_weight == "back-heavy":
-                weight_bonus = 1.0 if block >= 8 else (-0.5 if block <= 4 else 0.0)
+                score += 1.0 if block >= 8 else (-0.5 if block <= 4 else 0.0)
 
-            groups = code_to_groups.get(code, [])
+            # Staffing need
+            groups = code_to_groups.get(rotation, [])
             for codes_set, min_req in groups:
                 for w in grid.block_to_weeks(block):
                     score += get_staffing_need(grid, w, codes_set, min_req)
-            eligible.append((block, score + zir_bonus + weight_bonus))
 
-        if eligible:
-            # Pick the block with the highest staffing need
-            best_block = max(eligible, key=lambda x: x[1])[0]
-            _assign_block(res, grid, best_block, code)
-            filled[best_block] = code
-            used_blocks.add(best_block)
-            if code == "Zir":
-                zir_placed = True
+            # Run penalty: discourage consecutive same-rotation blocks
+            # NRDR R3s doing 6 blocks Mnuc — consecutive is expected/desired
+            run_pen = 0.0 if (res.is_nrdr and rotation == "Mnuc") else compute_run_penalty(res.schedule, block, rotation, grid)
+            score -= _RUN_PENALTY_WEIGHT * run_pen
+
+            scored_rotations.append((rotation, score))
+
+        if not scored_rotations:
+            continue
+
+        # Select rotation: top-K sampling when rng provided, else pick best
+        if rng is not None and top_k_sample > 1 and len(scored_rotations) > 1:
+            best_code, _ = weighted_sample_top_k(scored_rotations, top_k_sample, rng)
+        else:
+            # Add noise if rng provided (legacy behavior for top_k_sample=1)
+            if rng is not None:
+                scored_rotations = [(c, s + rng.gauss(0, _FILL_NOISE_SIGMA)) for c, s in scored_rotations]
+            scored_rotations.sort(key=lambda x: -x[1])
+            best_code = scored_rotations[0][0]
+
+        _assign_block(res, grid, block, best_code)
+        filled[block] = best_code
+        remaining_counts[best_code] -= 1
+        if best_code == "Zir":
+            zir_placed = True
 
     return filled
 
@@ -426,19 +530,27 @@ def _fill_r3_remaining(
     res: Resident,
     grid: ScheduleGrid,
     staffing_constraints: list[StaffingConstraint] | None = None,
+    rng: _random.Random | None = None,
+    shuffle_blocks: bool = False,
+    top_k_sample: int = 1,
 ) -> dict[int, str]:
     """Fill remaining empty R3 blocks with general clinical rotations.
 
     After graduation requirements are placed, any empty blocks are filled
     with rotations that help cover staffing needs: Peds (if short), then
     a round-robin of common clinical services.
+
+    Args:
+        shuffle_blocks: Randomize block order within schedule weight groups.
+        top_k_sample: Sample from top K rotations instead of best.
     """
+    from schedule_maker.staffing_utils import weighted_sample_top_k
     filled = {}
 
     available_blocks = []
     for block in range(1, 14):
         weeks = list(grid.block_to_weeks(block))
-        if not any(res.schedule.get(w) for w in weeks):
+        if not all(res.schedule.get(w) for w in weeks):
             available_blocks.append(block)
 
     if not available_blocks:
@@ -453,10 +565,31 @@ def _fill_r3_remaining(
                (code not in _ROTATION_YEAR_ELIGIBILITY or 3 in _ROTATION_YEAR_ELIGIBILITY[code]):
                 fill_rotations.append(code)
     # Sort available blocks by schedule weight preference
-    if res.schedule_weight == "front-heavy":
+    # When shuffle_blocks is enabled, shuffle within schedule weight groups
+    if shuffle_blocks and rng:
+        early = [b for b in available_blocks if b <= 6]
+        mid = [b for b in available_blocks if 6 < b < 10]
+        late = [b for b in available_blocks if b >= 10]
+        rng.shuffle(early)
+        rng.shuffle(mid)
+        rng.shuffle(late)
+        if res.schedule_weight == "back-heavy":
+            available_blocks = late + mid + early
+        elif res.schedule_weight == "front-heavy":
+            available_blocks = early + mid + late
+        else:
+            available_blocks = early + mid + late
+    elif res.schedule_weight == "front-heavy":
         available_blocks.sort()
     elif res.schedule_weight == "back-heavy":
         available_blocks.sort(reverse=True)
+
+    # Determine LC block for Zir eligibility check
+    _lc_block = None
+    for _b in range(1, 14):
+        if any(res.schedule.get(w) == "LC" for w in grid.block_to_weeks(_b)):
+            _lc_block = _b
+            break
 
     for block in list(available_blocks):
         has_zir = any(v == "Zir" for v in res.schedule.values())
@@ -464,21 +597,99 @@ def _fill_r3_remaining(
             grid, block, fill_rotations, res.section_prefs,
             constraints=staffing_constraints, r_year=3,
         )
-        for code, _score in ranked:
-            if code == "Zir" and has_zir:
-                continue
-            if not _has_hospital_conflict(res.schedule, block, code) and \
-               not block_exceeds_max(grid, block, code):
-                _assign_block(res, grid, block, code)
-                available_blocks.remove(block)
-                filled[block] = code
-                break
+        # Apply randomization: either top-K sampling or Gaussian noise
+        if rng is not None:
+            if top_k_sample > 1 and len(ranked) > 1:
+                # Use weighted sampling; don't add noise since sampling provides exploration
+                pass  # ranked stays as-is, sampling happens below
+            else:
+                ranked = sorted(
+                    [(c, s + rng.gauss(0, _FILL_NOISE_SIGMA)) for c, s in ranked],
+                    key=lambda x: -x[1],
+                )
+
+        # Force Zir to top when it has 0 staffing and resident is eligible
+        if not has_zir and (_lc_block is None or block < _lc_block - 1) \
+                and _block_fully_available(res, grid, block) \
+                and not _has_hospital_conflict(res.schedule, block, "Zir") \
+                and not block_exceeds_max(grid, block, "Zir") \
+                and not block_has_nf(res.schedule, block, grid, resident_name=res.name):
+            zir_unstaffed = all(
+                grid.get_section_staffing(w, {"Zir"}) < 1
+                for w in grid.block_to_weeks(block)
+            )
+            if zir_unstaffed:
+                ranked = [(c, s) for c, s in ranked if c != "Zir"]
+                ranked.insert(0, ("Zir", float("inf")))
+
+        # Force Mnuc to top for NRDR R3s who still need more Mnuc blocks
+        nrdr_mnuc_deficit = False
+        if res.is_nrdr:
+            mnuc_placed = sum(1 for v in res.schedule.values() if v == "Mnuc")
+            nrdr_mnuc_deficit = mnuc_placed < 24
+            if nrdr_mnuc_deficit and not _has_hospital_conflict(res.schedule, block, "Mnuc"):
+                ranked = [(c, s) for c, s in ranked if c != "Mnuc"]
+                ranked.insert(0, ("Mnuc", float("inf")))
+
+        # Helper to check if a rotation is valid for this block
+        def _is_valid_rotation(c: str) -> bool:
+            if c == "Zir" and has_zir:
+                return False
+            if c == "Zir" and not _block_fully_available(res, grid, block):
+                return False
+            if c == "Zir" and _lc_block is not None and block >= _lc_block - 1:
+                return False
+            if c in _IR_CODES and block_has_nf(res.schedule, block, grid, resident_name=res.name):
+                return False
+            nrdr_override = nrdr_mnuc_deficit and c == "Mnuc"
+            if _has_hospital_conflict(res.schedule, block, c):
+                return False
+            if not nrdr_override and block_exceeds_max(grid, block, c):
+                return False
+            return True
+
+        # Filter to valid rotations
+        valid_ranked = [(c, s) for c, s in ranked if _is_valid_rotation(c)]
+        if not valid_ranked:
+            continue
+
+        # Use top-K sampling when enabled, otherwise pick best with run penalty logic
+        if rng is not None and top_k_sample > 1 and len(valid_ranked) > 1:
+            code, _ = weighted_sample_top_k(valid_ranked, top_k_sample, rng)
+        else:
+            code, _score = valid_ranked[0]
+            # Penalize consecutive same-rotation runs; prefer lowest-penalty alternative
+            # NRDR R3s doing 6 blocks Mnuc — consecutive is expected/desired
+            run_pen = 0.0 if (res.is_nrdr and code == "Mnuc") else compute_run_penalty(res.schedule, block, code, grid)
+            if run_pen > 0:
+                candidates_by_penalty = sorted(
+                    [
+                        (c, (0.0 if (res.is_nrdr and c == "Mnuc") else compute_run_penalty(res.schedule, block, c, grid)))
+                        for c, _ in valid_ranked
+                        if c != code
+                    ],
+                    key=lambda x: x[1],
+                )
+                if candidates_by_penalty:
+                    alt_code, alt_pen = candidates_by_penalty[0]
+                    if alt_pen < run_pen:
+                        code = alt_code
+
+        _assign_block(res, grid, block, code)
+        available_blocks.remove(block)
+        filled[block] = code
 
     return filled
 
 
+def _block_fully_available(res: Resident, grid: ScheduleGrid, block: int) -> bool:
+    """Return True if all 4 weeks of the block are unassigned for the resident."""
+    return all(not res.schedule.get(w) for w in grid.block_to_weeks(block))
+
+
 def _assign_block(res: Resident, grid: ScheduleGrid, block: int, code: str) -> None:
-    """Assign a rotation code to all weeks of a block."""
+    """Assign a rotation code to all weeks of a block, skipping already-assigned weeks."""
     for w in grid.block_to_weeks(block):
-        grid.assign(res.name, w, code)
-        res.schedule[w] = code
+        if not res.schedule.get(w):
+            grid.assign(res.name, w, code)
+            res.schedule[w] = code
